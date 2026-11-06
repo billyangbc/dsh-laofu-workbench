@@ -40,3 +40,4 @@ test('Desktop materializes read-only pack sources under the writable product hom
   assert.equal(await lstat(source).then((stats) => stats.isDirectory()), true)
 })
 
+

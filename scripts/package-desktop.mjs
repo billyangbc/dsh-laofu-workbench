@@ -56,7 +56,7 @@ Options:
                          release registry (registry.npmjs.org). Point it at a mirror
                          when that host is unreachable from this network.
   --dry-run              print the resolved inputs and the command, then stop
-  --no-mirror-fallback   never substitute an Electron mirror when the release host is unreachable
+  --no-mirror-fallback   skip probing entirely; only an explicit ELECTRON_MIRROR is used
   -h, --help             show this message
 
 Environment:
@@ -127,6 +127,10 @@ async function resolveInputs(values, manifest) {
   const mirror = values['no-mirror-fallback']
     ? { mirror: process.env.ELECTRON_MIRROR?.trim() || undefined, source: 'no probe requested' }
     : await resolveElectronMirror({ env: process.env, version: electron, probe: url => probeDownload(url) })
+  if (mirror.source === 'release host unreachable') {
+    throw new Error('GitHub 的 Electron 下载源不可达；不会自动改用第三方镜像（其 zip 与 SHASUMS 同源，投毒可同时通过校验）。'
+      + ' 请检查网络，或显式设置 ELECTRON_MIRROR=<镜像地址>（知情承担），或 LWB_ELECTRON_MIRROR=auto 恢复自动回退。')
+  }
   return { edition, arch, target, pack, buildNumber, electron, mirror, npmRegistry }
 }
 

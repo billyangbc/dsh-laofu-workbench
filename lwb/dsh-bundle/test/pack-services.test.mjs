@@ -797,3 +797,22 @@ test('预设已经注册过时，会话照样打得开', async (t) => {
   assert.ok(session.id)
   assert.equal(calls.find(([kind]) => kind === 'session.create')[1].agentPreset, 'lwb-pack-no-tools')
 })
+
+test('credential refs differ by dash/underscore, stay isolated per slot, and read legacy normalized forms', async (t) => {
+  const { first, keys } = await setup(t)
+  const { packCredentialRef } = await import('../pack-workspaces.mjs')
+  /* 归一化后的长度前缀把 mykey(5) 与 my-key(6) 编成不同存储名——破折号/下划线
+     变体不会互相覆盖。仅大小写变体（MyKey/mykey）按设计共享一个槽位。 */
+  await first.credentials.set('MyKey', 'value-a')
+  await first.credentials.set('my_key', 'value-b')
+  assert.equal((await first.credentials.resolve('MyKey')).value, 'value-a')
+  assert.equal((await first.credentials.resolve('my_key')).value, 'value-b')
+  /* 旧版本存下的归一形态必须仍可读：BAILIAN_API_KEY 当年落在 bailian-api-key。 */
+  keys.set(packCredentialRef('spoken-video', 'bailian-api-key'), 'legacy-secret')
+  assert.equal((await first.credentials.resolve('BAILIAN_API_KEY')).value, 'legacy-secret')
+  assert.equal((await first.credentials.describe('BAILIAN_API_KEY')).configured, true)
+  /* unset 同时清掉新旧两个形态。 */
+  await first.credentials.unset('BAILIAN_API_KEY')
+  assert.equal((await first.credentials.describe('BAILIAN_API_KEY')).configured, false)
+  assert.equal(keys.has(packCredentialRef('spoken-video', 'bailian-api-key')), false)
+})

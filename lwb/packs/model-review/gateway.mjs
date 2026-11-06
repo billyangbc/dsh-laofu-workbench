@@ -7,6 +7,20 @@ function expose(prototype, method, name = method) {
   Remote(name)(prototype[method], { kind: 'method', name, static: false, private: false, addInitializer(initializer) { initializers.push(initializer) } })
 }
 
+/** How many runs may converse at once. Launching every selected model in one
+ * burst used to spin one full agent Session per model with no ceiling. */
+export function runConcurrency(environment = process.env) {
+  const raw = Number(environment.LWB_MODEL_REVIEW_CONCURRENCY)
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 4
+}
+
+/** Wall-clock budget for one run's answer. A stalled provider stream used to
+ * leave the run "running" forever, which permanently disabled the report. */
+export function runTimeoutMs(environment = process.env) {
+  const raw = Number(environment.LWB_MODEL_REVIEW_RUN_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
+}
+
 async function currentSnapshot(frames) {
   for await (const frame of frames) {
     if (frame.type === 'snapshot') return frame
@@ -190,7 +204,18 @@ export class ModelReviewGateway extends TypertRemoteService {
         if (route.selectable === false) throw new Error(route.unavailableReason || '所选模型路由尚不可用，请刷新后重试。')
       }
       const task = await this.ctx.modelReviewStore.createTask({ question, models })
-      for (const run of task.runs) this.ctx.modelReviewScope.background(this.launchRun(context, task.id, run, question.prompt))
+      /* Worker pool instead of a burst: every selected model still runs, but a
+         large selection no longer opens one agent Session per model at once. */
+      const queue = [...task.runs]
+      const worker = async () => {
+        for (;;) {
+          const run = queue.shift()
+          if (!run) return
+          await this.launchRun(context, task.id, run, question.prompt)
+        }
+      }
+      const workers = Array.from({ length: Math.max(1, Math.min(runConcurrency(), queue.length)) }, () => worker())
+      this.ctx.modelReviewScope.background(Promise.all(workers))
       return task
     })
   }
@@ -207,8 +232,23 @@ export class ModelReviewGateway extends TypertRemoteService {
     try {
       session = await this.ctx.modelReviewScope.sessions.create({ ...run.model, cwd: run.cwd })
       await this.ctx.modelReviewStore.updateRun(taskId, run.id, { status: 'running', sessionId: session.id })
-      await session.followup(prompt)
-      await session.whenIdle()
+      /* One wall-clock budget per run. The losing promise keeps a no-op catch so
+         a late rejection after a timeout cannot surface as unhandled. */
+      const answerWork = (async () => { await session.followup(prompt); await session.whenIdle() })()
+      answerWork.catch(() => {})
+      const timeoutMs = runTimeoutMs()
+      let timer = null
+      try {
+        await Promise.race([
+          answerWork,
+          new Promise((resolve, reject) => {
+            timer = setTimeout(() => {
+              try { session.cancel?.() } catch { /* best effort; dispose follows */ }
+              reject(new Error(`单个模型作答超过 ${timeoutMs} 毫秒未完成，已停止该轮。`))
+            }, timeoutMs)
+          }),
+        ])
+      } finally { clearTimeout(timer) }
       const page = await currentSnapshot(session.follow({ maxMessages: 500 }))
       const answer = executionFrame(page)
       const finalAnswer = answer.records?.filter((item) => item.event?.type === 'assistant/message').at(-1)?.event?.data || null

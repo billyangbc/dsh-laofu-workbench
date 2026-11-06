@@ -79,3 +79,32 @@ test('the packaged browser is the one playwright-core reports', () => {
   const binary = packagedBrowser()
   assert.match(binary, /(chrome-headless-shell|Chromium|Google Chrome for Testing|chrome)$/u)
 })
+
+/**
+ * `LWB_BROWSER_NO_SANDBOX=0` is the explicit opt-out for the shim: the user
+ * accepts the provider's own (sandboxed) default — including the possibility
+ * that the Session crashes on macOS — in exchange for keeping the sandbox on.
+ * The shim must not exist afterwards, so nothing can exec it by accident.
+ */
+test('LWB_BROWSER_NO_SANDBOX=0 opts out of the shim entirely', async (t) => {
+  const root = await workspace(t)
+  const resolved = resolveBrowserExecutable({ environment: { LWB_BROWSER_NO_SANDBOX: '0' }, directory: root, binary: '/tmp/Chrome' })
+  assert.equal(resolved, undefined)
+  await assert.rejects(stat(join(root, 'chromium-nosandbox.sh')), { code: 'ENOENT' })
+})
+
+/** Only an explicit negation opts out; "1", "true" and the odd typo keep the shim. */
+test('truthy or malformed LWB_BROWSER_NO_SANDBOX values keep the shim', async (t) => {
+  const root = await workspace(t)
+  for (const value of ['1', 'true', 'yes', '']) {
+    const resolved = resolveBrowserExecutable({ environment: { LWB_BROWSER_NO_SANDBOX: value }, directory: join(root, value || 'empty'), binary: '/tmp/Chrome' })
+    assert.notEqual(resolved, undefined, `value ${JSON.stringify(value)} must not disable the shim`)
+  }
+})
+
+/** The opt-out must not be able to override an explicitly named binary. */
+test('an explicit executable beats the no-sandbox opt-out', async (t) => {
+  const root = await workspace(t)
+  const resolved = resolveBrowserExecutable({ environment: { LWB_BROWSER_NO_SANDBOX: '0', LWB_BROWSER_EXECUTABLE: '/Applications/Some Chrome.app' }, directory: root })
+  assert.equal(resolved, '/Applications/Some Chrome.app')
+})

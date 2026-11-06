@@ -11,6 +11,11 @@ function quoted(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`
 }
 
+/** Only an explicit negation opts out; anything else (or a typo) keeps the shim. */
+function sandboxOptedOut(environment) {
+  return ['0', 'false', 'off'].includes(String(environment.LWB_BROWSER_NO_SANDBOX ?? '').trim().toLowerCase())
+}
+
 /**
  * The browser this profile would launch if nobody named one: Playwright's own
  * download, resolved through the `playwright-core` that the mounted provider
@@ -70,9 +75,13 @@ function writeShim(target, binary) {
  *
  * An explicit `LWB_BROWSER_EXECUTABLE` wins untouched: someone who names a
  * binary has already decided what to launch, and wrapping it would be this
- * module overriding that decision. A failure anywhere returns `undefined`,
- * which leaves the provider on its own default -- a browser that might crash
- * is still better than a Session that refuses to start.
+ * module overriding that decision. `LWB_BROWSER_NO_SANDBOX=0` is the explicit
+ * way to refuse the flag instead: it returns `undefined` and leaves the
+ * provider on its sandboxed default, accepting that the Session may then hit
+ * the macOS sandbox crash this shim exists to route around. A failure
+ * anywhere returns `undefined`, which leaves the provider on its own default
+ * -- a browser that might crash is still better than a Session that refuses
+ * to start.
  * @param options.environment - environment to read the override from.
  * @param options.runtime - DSH installation to resolve the dependency from.
  * @param options.directory - where to put the shim; defaults to pack state.
@@ -82,6 +91,7 @@ function writeShim(target, binary) {
 export function resolveBrowserExecutable({ environment = process.env, runtime = LWB_RUNTIME.dshRuntimeDir, directory, binary } = {}) {
   const explicit = typeof environment.LWB_BROWSER_EXECUTABLE === 'string' ? environment.LWB_BROWSER_EXECUTABLE.trim() : ''
   if (explicit) return explicit
+  if (sandboxOptedOut(environment)) return undefined
   // A `.cmd` cannot be exec'd the way the provider spawns it, and Windows does
   // not hit this sandbox failure in the first place.
   if (process.platform === 'win32') return undefined

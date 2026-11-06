@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LWB_RUNTIME } from './runtime-config.mjs'
@@ -139,13 +139,20 @@ async function readRegistry() {
   return normalizeRegistry(await jsonFile(path, 'LWB pack registry'))
 }
 
-async function writeRegistry(value) {
+export async function writeRegistry(value) {
   const normalized = normalizeRegistry(value)
   const path = registryPath()
   await mkdir(dirname(path), { recursive: true })
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`
   await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
-  await rename(temporary, path)
+  try {
+    await rename(temporary, path)
+  } catch (error) {
+    // A failed rename used to leave the .tmp behind, and the wx flag means a
+    // retry of the same name can never happen — the residue only accumulates.
+    await unlink(temporary).catch(() => {})
+    throw error
+  }
 }
 
 function registryPath() {

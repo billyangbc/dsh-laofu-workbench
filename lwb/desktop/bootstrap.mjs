@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { installLwbEntryPolicy } from './lwb-entry-policy.mjs'
 import { migrateRuntimePackRegistry } from './registry-migration.mjs'
+import { recordRuntimeIntegrity, runtimeIntegrityFailure } from './runtime-integrity.mjs'
 
 const payload = join(process.resourcesPath, 'lwb-product')
 const build = JSON.parse(await readFile(join(payload, 'build.json'), 'utf8'))
@@ -73,11 +74,19 @@ async function boot() {
   const runtime = join(productHome, 'runtime', build.id)
   // The writable copy owns peer links and dynamic pack code. Business data is
   // outside it; replacing a product build never rewrites a pack workspace.
-  if (!await stat(join(runtime, 'build.json')).catch(ignoreMissing)) {
+  // A copy whose shipped code drifted from its install-time integrity record
+  // is rebuilt from the immutable payload instead of being executed as-is.
+  const integrity = await runtimeIntegrityFailure(runtime)
+  if (integrity !== null) {
+    if (await stat(join(runtime, 'build.json')).catch(ignoreMissing)) {
+      console.warn(`[lwb] 重建运行时副本（${integrity}）。`)
+      await rm(runtime, { recursive: true, force: true })
+    }
     const temporary = `${runtime}.${process.pid}.tmp`
     await mkdir(join(productHome, 'runtime'), { recursive: true })
     try {
       await cp(payload, temporary, { recursive: true })
+      await recordRuntimeIntegrity(temporary)
       await rename(temporary, runtime)
     } finally { await rm(temporary, { recursive: true, force: true }) }
   }

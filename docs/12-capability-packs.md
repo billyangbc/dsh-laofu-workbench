@@ -133,10 +133,13 @@ h('article', { onPointerDownCapture: () => focusSession(run.sessionId) },
 预设驱动的浏览器由 `lwb/dsh-bundle/browser-shim.mjs` 决定，不是简单读一个环境变量：
 
 - `LWB_BROWSER_EXECUTABLE` 显式给了值，就原样用——谁点名了二进制，就不该被这层改写。
+- `LWB_BROWSER_NO_SANDBOX` 设为 `0`/`false`/`off` 是对 shim 的显式拒绝：返回 `undefined`，provider 落回自己的（带沙箱）默认值。代价是会话可能撞上下面描述的 macOS 沙箱崩溃——这是知情选择，不是被修好的路径。
 - 没给，就没有"缺省交给上游下载"这回事：bundle 解析出 `playwright-core` 自己会用的那颗 Chromium，生成一个两行 shim（`exec <binary> --no-sandbox "$@"`）放进 `pack-state/browser/chromium-nosandbox.sh`，把 shim 当 `executablePath` 传下去。内容没变就不重写，权限固定 `0o755`。
 - Windows 跳过（`.cmd` 没法被 provider 那样 exec，且那边不撞这个沙箱问题）；任何一步失败返回 `undefined`，让 provider 用它自己的默认值——一个可能崩的浏览器，强过一条起不来的会话。
 
 为什么要包一层：`@playwright/mcp` 默认 `chromiumSandbox: true`，而 Playwright 自己的 API 默认 `false`。从 Node 子进程拉起浏览器时，那个沙箱在这里初始不起来（`sandbox initialization failed: Operation not permitted`），GPU 与 network 服务接连倒下，渲染进程收 `SIGSEGV`，调用方只看到 `browserBackend.callTool: Target crashed`。该开的开关 MCP 自己有（`--no-sandbox`），但 `BrowserMcpConfig` 没有转发 args 的字段，它还会把所有 `PLAYWRIGHT_MCP_*` 变量清成空串再 spawn——而 MCP 的 `envToBoolean('')` 返回 `undefined`，等于没设。`executablePath` 是唯一能碰到命令行的口子，所以开关搭在 shim 上进来。代价是浏览器进程沙箱被关掉，这是产品决策，记录在商业包 `docs/yuchi-p2-plan.md` §7。
+
+**这条路径的安全边界要知道**：预设会话里的浏览器**没有 Chromium 沙箱**，模型能驱动它访问任意外部网页；角色专用浏览器（`pack-browser`）在本机开 **CDP 调试端口且无鉴权**，端口文件里记录的浏览器指纹只用于"防止误连"，挡不住同机恶意进程。本机单用户是前提——只加载可信来源的包，不要在多用户机器上运行带浏览器会话的包。
 
 `sessions.inbound(sessionId, message)` 把一条外部渠道消息投进包自有会话。它不走 `sessionController.prompt`：那条路径把来源固定写成 `user-rpc`，会声称消息是用户在工作台里打的。入站消息在 Host 内构造 `user/message`，沿用 LWB 唯一的自有来源 `kind: 'lwb'`，渠道信息放在同一对象里（`channel` / `externalId` / `messageId`），渠道重投与"她当时不在线"因此可判定。只接受文本；附件必须由适配器先落进包工作区。来源不是 `user` 的消息不会被技能触发扫描命中，这是刻意的：渠道里来的字不能当成本地指令。
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, symlink, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readFile, readdir, readlink, realpath, rename, symlink, unlink, writeFile } from 'node:fs/promises'
 import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -53,24 +53,73 @@ async function ensureLinkedNodeModules(projectDir) {
   return true
 }
 
+const DEPENDENCY_FINGERPRINT_FILE = 'dependency-fingerprint.txt'
+
+/**
+ * One digest over a dependency tree: relative paths and file contents, in a
+ * stable order. The creative Agent's workspace-write sandbox can follow the
+ * per-entry node_modules symlinks into the shared install, so the tree is
+ * fingerprinted when a task is linked and again before its render runs.
+ */
+export async function sharedDependencyFingerprint(root = APP_NODE_MODULES) {
+  const digest = createHash('sha256')
+  const walk = async directory => {
+    const entries = []
+    for await (const entry of await readdir(directory, { withFileTypes: true }).catch(() => { throw new Error(`依赖目录不可读：${directory}`) })) entries.push(entry)
+    entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))
+    for (const entry of entries) {
+      const path = join(directory, entry.name)
+      if (entry.isSymbolicLink()) {
+        digest.update(`link:${relativeSafe(root, path)}\u0000${await readlink(path)}\u0000`)
+      } else if (entry.isDirectory()) {
+        await walk(path)
+      } else if (entry.isFile()) {
+        digest.update(`file:${relativeSafe(root, path)}\u0000`)
+        digest.update(await readFile(path))
+        digest.update('\u0000')
+      }
+    }
+  }
+  await walk(root)
+  return digest.digest('hex')
+}
+
+function relativeSafe(root, path) {
+  return path === root ? '' : path.slice(root.length + 1)
+}
+
+/**
+ * Verify the shared dependency tree against the baseline recorded when the
+ * task was linked. Returns null when everything matches (or the task predates
+ * baselines); returns a message naming the drift otherwise.
+ */
+export async function verifySharedDependencies(projectDir, { sharedRoot = APP_NODE_MODULES } = {}) {
+  const expected = (await readFile(join(projectDir, DEPENDENCY_FINGERPRINT_FILE), 'utf8').catch(() => null))?.trim()
+  if (!expected) return null
+  const current = await sharedDependencyFingerprint(sharedRoot)
+  return current === expected ? null : `任务创建后共享依赖被改动（基线 ${expected.slice(0, 12)}，当前 ${current.slice(0, 12)}）。请重建任务依赖后再渲染。`
+}
+
 // Share dependencies and the installed browser; keep Webpack caches task-local.
-export async function ensureAgentDependencies(projectDir) {
+export async function ensureAgentDependencies(projectDir, { sharedRoot = APP_NODE_MODULES } = {}) {
   const target = join(projectDir, 'node_modules')
   const info = await lstat(target).catch(() => null)
   if (info?.isSymbolicLink()) {
-    if (await realpath(target) !== await realpath(APP_NODE_MODULES)) throw new Error('任务依赖链接指向未知目录。')
+    if (await realpath(target) !== await realpath(sharedRoot)) throw new Error('任务依赖链接指向未知目录。')
     await unlink(target)
   } else if (info && !info.isDirectory()) throw new Error('任务依赖目录无效。')
   await mkdir(target, { recursive: true, mode: 0o700 })
-  const entries = await readdir(APP_NODE_MODULES)
+  const entries = await readdir(sharedRoot)
   for (const name of entries.filter((name) => !name.startsWith('.') || ['.bin', '.remotion'].includes(name))) {
     const link = join(target, name)
-    if (!await exists(link)) await symlink(join(APP_NODE_MODULES, name), link)
+    if (!await exists(link)) await symlink(join(sharedRoot, name), link)
   }
   const cache = join(target, '.cache')
   const cacheInfo = await lstat(cache).catch(() => null)
   if (cacheInfo?.isSymbolicLink()) throw new Error('任务缓存不得链接到共享目录。')
   await mkdir(cache, { recursive: true, mode: 0o700 })
+  // Baseline for the pre-render drift check; see verifySharedDependencies.
+  await writeFile(join(projectDir, DEPENDENCY_FINGERPRINT_FILE), `${await sharedDependencyFingerprint(sharedRoot)}\n`, 'utf8')
 }
 
 function entrySource() {
@@ -373,7 +422,19 @@ export async function prepareSpokenVideoAgentProject({ projectRoot, runId, title
 }
 
 /** Reject placeholder output and changes to the deterministic shell before rendering. */
-export const inspectSpokenVideoAgentProject = inspectAgentProject
+/** Inspect plus the shared-dependency drift check: a polluted shared install
+ * must fail the render with a named cause instead of shipping tainted output. */
+export async function inspectSpokenVideoAgentProject(workspace) {
+  const result = await inspectAgentProject(workspace)
+  const drift = await verifySharedDependencies(workspace.projectDir).catch(() => null)
+  if (drift) {
+    result.findings.push({ code: 'shared-dependencies', file: 'node_modules', line: 1, column: 1, message: drift })
+    result.passed = false
+    result.repairable = false
+    result.failures.push(`node_modules:1:1 ${drift}`)
+  }
+  return result
+}
 
 /** Keep normal spoken-video renders below the host's 80 MiB artifact boundary. */
 export function remotionEncodingSettings(durationSeconds) {

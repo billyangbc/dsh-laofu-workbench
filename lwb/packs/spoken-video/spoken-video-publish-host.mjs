@@ -284,16 +284,21 @@ export class SpokenVideoPublishHost {
    * them failed once and let the user retry rather than showing a stuck task.
    */
   async #recoverInterrupted(root) {
-    const data = await readTasks(root)
-    let changed = false
-    const now = new Date().toISOString()
-    for (const task of data.tasks) {
-      if (['queued', 'running'].includes(task.status) && !this.active.has(task.id)) {
-        task.status = 'failed'; task.phase = 'failed'; task.error = '应用重启中断了发布包装任务，请重试。'; task.updatedAt = now; task.completedAt = now; changed = true
+    /* Read and write inside the same serial section: this fires from read
+       paths, and a snapshot taken outside the lock used to roll back a status
+       that a concurrent #mutateTask had just written. */
+    return this.#serial(root, async () => {
+      const data = await readTasks(root)
+      let changed = false
+      const now = new Date().toISOString()
+      for (const task of data.tasks) {
+        if (['queued', 'running'].includes(task.status) && !this.active.has(task.id)) {
+          task.status = 'failed'; task.phase = 'failed'; task.error = '应用重启中断了发布包装任务，请重试。'; task.updatedAt = now; task.completedAt = now; changed = true
+        }
       }
-    }
-    if (changed) await this.#serial(root, () => writeTasks(root, data))
-    return data.tasks
+      if (changed) await writeTasks(root, data)
+      return data.tasks
+    })
   }
 
   async #mutateTask(root, id, mutate) {

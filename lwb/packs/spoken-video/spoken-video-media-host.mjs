@@ -1153,11 +1153,10 @@ export class SpokenVideoMediaHost {
     const accountId = typeof input.accountId === 'string' && input.accountId.trim() ? projectId(input.accountId) : null
     const generalOnly = input.general === true
     const root = await audioTasksRootFor(agent)
-    const tasks = await readAudioTasks(root)
     const query = typeof input.query === 'string' ? input.query.trim().toLowerCase() : ''
     const status = typeof input.status === 'string' && ['all', 'active', 'terminal', 'queued', 'running', 'succeeded', 'failed'].includes(input.status) ? input.status : 'all'
     const provider = typeof input.provider === 'string' && ['all', 'bailian', 'lwb', 'legacy'].includes(input.provider) ? input.provider : 'all'
-    const recovered = await this.#recoverInterruptedAudioTasks(root, tasks)
+    const recovered = await this.#recoverInterruptedAudioTasks(root)
     const projects = await this.projectsStore.list(agent)
     const projectTasks = (await Promise.all(projects.map((project) => this.#projectAudioTasks(agent, project.id)))).flatMap((entry) => entry.tasks)
     const standaloneIds = new Set(recovered.tasks.map((task) => task.id))
@@ -1244,7 +1243,11 @@ export class SpokenVideoMediaHost {
     const task = { id, type: 'voiceover', status: 'queued', createdAt: now, source, input: data, projectRevision: project?.revision || null, subtitle: { status: 'idle' } }
     await this.#mutateAudioTaskFile(root, (file) => ({ ...file, tasks: [...file.tasks, task].slice(-AUDIO_TASK_LIMIT) }))
     this.activeAudioTaskRuns.add(`${task.id}:voiceover`)
-    void this.background(this.#runAudioTask(agent, root, task.id).finally(() => this.activeAudioTaskRuns.delete(`${task.id}:voiceover`)))
+    // The catch-all keeps a broken task file from ending the host process:
+    // when the failure recorder itself fails, the rejection has nowhere to go.
+    void this.background(this.#runAudioTask(agent, root, task.id)
+      .catch((error) => { console.warn('[spoken-video] 配音任务后台链异常退出：', error?.message || error) })
+      .finally(() => this.activeAudioTaskRuns.delete(`${task.id}:voiceover`)))
     return audioTaskSummary(task)
   }
 
@@ -1287,7 +1290,9 @@ export class SpokenVideoMediaHost {
       subtitle: { ...(task.subtitle || {}), id: subtitleId, status: 'queued', createdAt: new Date().toISOString(), startedAt: null, completedAt: null, error: null, input: data },
     }))
     this.activeAudioTaskRuns.add(`${taskId}:subtitles`)
-    void this.background(this.#runAudioTaskSubtitles(agent, root, taskId, subtitleId).finally(() => this.activeAudioTaskRuns.delete(`${taskId}:subtitles`)))
+    void this.background(this.#runAudioTaskSubtitles(agent, root, taskId, subtitleId)
+      .catch((error) => { console.warn('[spoken-video] 字幕任务后台链异常退出：', error?.message || error) })
+      .finally(() => this.activeAudioTaskRuns.delete(`${taskId}:subtitles`)))
     return audioTaskSummary(started)
   }
 
@@ -1400,23 +1405,30 @@ export class SpokenVideoMediaHost {
     const detail = await this.projectsStore.get(agent, { projectId: id })
     if (detail.revision !== revision) fail('SPOKEN_VIDEO_REVISION_CONFLICT', '项目已被其他操作更新，请刷新后重试。')
     const data = await this.#bindAccount(await parseInput(input, { root, detail }), type === 'voiceover' ? 'tts' : 'subtitle', input.lwbUserId)
-    const runs = await readRuns(root)
-    const active = runs.runs.find((run) => run.type === type && ['queued', 'running'].includes(run.status) && run.expectedRevision === revision && (type !== 'video' || (
-      (run.input?.orientation === 'landscape' ? 'landscape' : 'portrait') === data.orientation
-      && run.input?.renderer === data.renderer
-      && (run.input?.subtitleEnabled !== false) === data.subtitleEnabled
-      && (run.input?.backgroundMusic?.file || null) === (data.backgroundMusic?.file || null)
-      && (run.input?.bgmVolume ?? null) === data.bgmVolume
-      && run.input?.visualBrief === data.visualBrief
-    )))
-    if (active) return { ...runSummary(active), reused: true }
-    const now = new Date().toISOString()
-    const run = {
-      id: requestId(), type, status: 'queued', projectId: id, expectedRevision: revision, createdAt: now, input: data,
-      source: videoSourceSnapshot(detail, data.subtitleEnabled),
-    }
-    runs.runs = [...runs.runs, run].slice(-80)
-    await writeRuns(root, runs)
+    /* Append inside the serial chain: two submissions in one tick used to read
+       the same file and each append their own copy, and the last write erased
+       the other's record while its background chain kept executing. */
+    let appended = null
+    await this.#mutateRunsFile(root, (file) => {
+      const active = file.runs.find((run) => run.type === type && ['queued', 'running'].includes(run.status) && run.expectedRevision === revision && (type !== 'video' || (
+        (run.input?.orientation === 'landscape' ? 'landscape' : 'portrait') === data.orientation
+        && run.input?.renderer === data.renderer
+        && (run.input?.subtitleEnabled !== false) === data.subtitleEnabled
+        && (run.input?.backgroundMusic?.file || null) === (data.backgroundMusic?.file || null)
+        && (run.input?.bgmVolume ?? null) === (data.bgmVolume)
+        && run.input?.visualBrief === data.visualBrief
+      )))
+      if (active) { appended = { reused: active }; return file }
+      const now = new Date().toISOString()
+      const run = {
+        id: requestId(), type, status: 'queued', projectId: id, expectedRevision: revision, createdAt: now, input: data,
+        source: videoSourceSnapshot(detail, data.subtitleEnabled),
+      }
+      appended = { run }
+      return { ...file, runs: [...file.runs, run].slice(-80) }
+    })
+    if (appended.reused) return { ...runSummary(appended.reused), reused: true }
+    const run = appended.run
     // Mark before scheduling so an immediate status poll cannot mistake this process for a restart.
     this.activeRunIds.add(run.id)
     const queueKey = `${root}\u0000${type}`
@@ -1428,6 +1440,20 @@ export class SpokenVideoMediaHost {
       if (this.queues.get(queueKey) === work) this.queues.delete(queueKey)
     })
     return { ...runSummary(run), reused: false }
+  }
+
+  /** Like #mutateAudioTaskFile, but returning the same reference skips the write. */
+  async #mutateAudioTaskFileRaw(root, mutate) {
+    const previous = this.audioTaskWrites.get(root) || Promise.resolve()
+    const result = previous.then(async () => {
+      const file = await readAudioTasks(root)
+      const next = mutate(file)
+      if (next !== file) await writeAudioTasks(root, next)
+      return next
+    })
+    const tail = result.catch(() => {})
+    this.audioTaskWrites.set(root, tail)
+    try { return await result } finally { if (this.audioTaskWrites.get(root) === tail) this.audioTaskWrites.delete(root) }
   }
 
   async #mutateAudioTaskFile(root, mutate) {
@@ -1459,25 +1485,25 @@ export class SpokenVideoMediaHost {
     return changed
   }
 
-  async #recoverInterruptedAudioTasks(root, tasks = null) {
-    const file = tasks || await readAudioTasks(root)
-    let changed = false
-    const recovered = file.tasks.map((task) => {
-      let next = task
-      if (['queued', 'running'].includes(task.status) && !this.activeAudioTaskRuns.has(`${task.id}:voiceover`)) {
-        changed = true
-        next = { ...next, status: 'failed', completedAt: new Date().toISOString(), error: '媒体主机在任务完成前已重启。请重新提交配音任务。' }
-      }
-      if (['queued', 'running'].includes(next.subtitle?.status) && !this.activeAudioTaskRuns.has(`${task.id}:subtitles`)) {
-        changed = true
-        next = { ...next, subtitle: { ...next.subtitle, status: 'failed', completedAt: new Date().toISOString(), error: '媒体主机在字幕完成前已重启。请重新生成字幕。' } }
-      }
-      return next
+  /* Inside the serial chain for the same reason as #recoverInterruptedRuns:
+     it fires from read paths and must not roll back a concurrent mutation. */
+  async #recoverInterruptedAudioTasks(root) {
+    return this.#mutateAudioTaskFileRaw(root, (file) => {
+      let changed = false
+      const recovered = file.tasks.map((task) => {
+        let next = task
+        if (['queued', 'running'].includes(task.status) && !this.activeAudioTaskRuns.has(`${task.id}:voiceover`)) {
+          changed = true
+          next = { ...next, status: 'failed', completedAt: new Date().toISOString(), error: '媒体主机在任务完成前已重启。请重新提交配音任务。' }
+        }
+        if (['queued', 'running'].includes(next.subtitle?.status) && !this.activeAudioTaskRuns.has(`${task.id}:subtitles`)) {
+          changed = true
+          next = { ...next, subtitle: { ...next.subtitle, status: 'failed', completedAt: new Date().toISOString(), error: '媒体主机在字幕完成前已重启。请重新生成字幕。' } }
+        }
+        return next
+      })
+      return changed ? { ...file, tasks: recovered } : file
     })
-    if (!changed) return file
-    const next = { ...file, tasks: recovered }
-    await writeAudioTasks(root, next)
-    return next
   }
 
   async #uploadedVoiceReference(root, reference, pattern, label) {
@@ -1691,6 +1717,26 @@ export class SpokenVideoMediaHost {
     }
   }
 
+  /**
+   * Serialize a whole-file mutation of runs.json. Every append, recovery pass
+   * and per-run mutation goes through this chain: a read-modify-write that
+   * bypasses it races a concurrent submit and the loser's record is silently
+   * dropped while its background chain keeps executing.
+   * Returning the same object reference skips the write (unchanged recovery).
+   */
+  async #mutateRunsFile(root, mutate) {
+    const previous = this.runWrites.get(root) || Promise.resolve()
+    const result = previous.then(async () => {
+      const file = await readRuns(root)
+      const next = mutate(file)
+      if (next !== file) await writeRuns(root, next)
+      return next
+    })
+    const tail = result.catch(() => {})
+    this.runWrites.set(root, tail)
+    try { return await result } finally { if (this.runWrites.get(root) === tail) this.runWrites.delete(root) }
+  }
+
   async #mutateRun(root, runId, mutator) {
     const previous = this.runWrites.get(root) || Promise.resolve()
     const work = previous.then(async () => {
@@ -1717,30 +1763,32 @@ export class SpokenVideoMediaHost {
   }
 
   async #recoverInterruptedRuns(root) {
-    const runs = await readRuns(root)
-    let changed = false
-    const nowMs = Date.now()
-    const recovered = runs.runs.map((run) => {
-      const queueKey = `${root}\u0000${run.type}`
-      const submittedAtMs = Date.parse(run.startedAt || run.createdAt || '')
-      // A run is durably written before its Promise chain enters the queue. Give that
-      // handoff a short window so an immediate status poll cannot look like a restart.
-      const stillEnteringQueue = Number.isFinite(submittedAtMs) && nowMs - submittedAtMs < RUN_RECOVERY_GRACE_MS
-      if (['queued', 'running'].includes(run.status) && !stillEnteringQueue && !this.queues.has(queueKey) && !this.activeRunIds.has(run.id)) {
-        changed = true
-        return {
-          ...run,
-          status: 'failed',
-          completedAt: new Date().toISOString(),
-          error: '媒体主机在任务完成前已重启。请在当前项目版本上重新提交任务。',
+    /* Inside the serial chain: this runs on read paths (list/poll), so an
+       unlocked snapshot used to roll back a run status that a concurrent
+       #mutateRun had just written. Returning the same reference skips the
+       write when nothing needed recovery. */
+    return this.#mutateRunsFile(root, (file) => {
+      const nowMs = Date.now()
+      let changed = false
+      const recovered = file.runs.map((run) => {
+        const queueKey = `${root}\u0000${run.type}`
+        const submittedAtMs = Date.parse(run.startedAt || run.createdAt || '')
+        // A run is durably written before its Promise chain enters the queue. Give that
+        // handoff a short window so an immediate status poll cannot look like a restart.
+        const stillEnteringQueue = Number.isFinite(submittedAtMs) && nowMs - submittedAtMs < RUN_RECOVERY_GRACE_MS
+        if (['queued', 'running'].includes(run.status) && !stillEnteringQueue && !this.queues.has(queueKey) && !this.activeRunIds.has(run.id)) {
+          changed = true
+          return {
+            ...run,
+            status: 'failed',
+            completedAt: new Date().toISOString(),
+            error: '媒体主机在任务完成前已重启。请在当前项目版本上重新提交任务。',
+          }
         }
-      }
-      return run
+        return run
+      })
+      return changed ? { ...file, runs: recovered } : file
     })
-    if (!changed) return runs
-    const next = { ...runs, runs: recovered }
-    await writeRuns(root, next)
-    return next
   }
 
   async #run(agent, root, queued) {

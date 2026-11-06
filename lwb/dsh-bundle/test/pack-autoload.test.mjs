@@ -155,3 +155,4 @@ test('spoken-video pins DSH peers to the supported release and declares the LWB 
   }
   assert.equal(packageJson.peerDependencies['@scitiger-ai/lwb-pack-sdk'], '0.1.0')
 })
+

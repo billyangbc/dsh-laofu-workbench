@@ -1044,3 +1044,22 @@ test('run history retains more than 100 rounds and filters before paging lightwe
   await assert.rejects(host.listScheduleRuns(currentAgent, { limit: 51 }), /分页参数/u)
   await assert.rejects(host.listScheduleRuns(currentAgent, { status: 'invalid' }), /状态筛选/u)
 })
+
+test('同一工作区两轮并发触发只允许一轮启动（检查与登记必须原子）', async (t) => {
+  const { host, currentAgent, file } = await setup(t)
+  await createTask(host, currentAgent)
+  const paths = await host.paths(currentAgent)
+  const schedule = JSON.parse(await readFile(file, 'utf8')).schedules[0]
+  const [first, second] = await Promise.allSettled([
+    host.startRun(paths, schedule, 'manual'),
+    host.startRun(paths, schedule, 'manual'),
+  ])
+  const fulfilled = [first, second].filter((item) => item.status === 'fulfilled')
+  const rejected = [first, second].filter((item) => item.status === 'rejected')
+  assert.equal(fulfilled.length, 1, `同一 tick 的两次触发必须恰有一轮获准，实际 ${fulfilled.length}`)
+  assert.equal(rejected.length, 1, '另一轮必须被忙碌错误拒绝')
+  assert.match(String(rejected[0].reason), /已有一轮自动化/u)
+  await settleRun(host, currentAgent, fulfilled[0].value.runId)
+  const after = JSON.parse(await readFile(file, 'utf8'))
+  assert.equal(after.runs.filter((run) => run.scheduleId === schedule.id).length, 1, '该安排只落一条执行记录')
+})

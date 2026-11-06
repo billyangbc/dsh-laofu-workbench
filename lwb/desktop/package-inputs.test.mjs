@@ -139,7 +139,7 @@ test('an explicit Electron mirror wins and is never probed', async () => {
   assert.equal(probed, 0)
 })
 
-test('the mirror fallback is used only when the release host cannot serve the checksum', async () => {
+test('an unreachable release host fails by default; a third-party mirror is an explicit choice', async () => {
   const probes = []
   const reachable = await resolveElectronMirror({
     env: {},
@@ -149,14 +149,23 @@ test('the mirror fallback is used only when the release host cannot serve the ch
   assert.deepEqual(reachable, { mirror: undefined, source: 'release host' })
   assert.deepEqual(probes, [releaseChecksumUrl('44.0.0')], 'the release host is tried first and alone')
 
+  /* 默认不得静默改用第三方镜像：那里的 zip 与 SHASUMS 同源，投毒可同时通过校验。 */
   const blocked = await resolveElectronMirror({
     env: {},
     version: '44.0.0',
     probe: async url => url === `${ELECTRON_MIRROR_FALLBACK}44.0.0/SHASUMS256.txt`,
   })
-  assert.deepEqual(blocked, { mirror: ELECTRON_MIRROR_FALLBACK, source: 'mirror fallback' })
+  assert.deepEqual(blocked, { mirror: undefined, source: 'release host unreachable' })
 
-  const neither = await resolveElectronMirror({ env: {}, version: '44.0.0', probe: async () => false })
+  /* LWB_ELECTRON_MIRROR=auto 是知情选择，恢复旧的探测行为。 */
+  const auto = await resolveElectronMirror({
+    env: { LWB_ELECTRON_MIRROR: 'auto' },
+    version: '44.0.0',
+    probe: async url => url === `${ELECTRON_MIRROR_FALLBACK}44.0.0/SHASUMS256.txt`,
+  })
+  assert.deepEqual(auto, { mirror: ELECTRON_MIRROR_FALLBACK, source: 'mirror fallback (auto)' })
+
+  const neither = await resolveElectronMirror({ env: { LWB_ELECTRON_MIRROR: 'auto' }, version: '44.0.0', probe: async () => false })
   assert.deepEqual(neither, { mirror: undefined, source: 'no reachable download source' })
 
   const unknown = await resolveElectronMirror({
@@ -179,6 +188,23 @@ test('probing disabled keeps the release host without any request', async () => 
   })
   assert.deepEqual(disabled, { mirror: undefined, source: 'probing disabled' })
   assert.equal(probed, 0, 'opting out skips the probe entirely')
+})
+
+test('the packaging environment is an allowlist: toolchain paths survive, ambient secrets do not', () => {
+  const environment = unsignedPackagingEnvironment({
+    PATH: '/usr/bin', HOME: '/Users/build', LANG: 'zh_CN.UTF-8', LC_ALL: 'zh_CN.UTF-8', TMPDIR: '/tmp/x',
+    HTTPS_PROXY: 'http://proxy.example:3128', GOFLAGS: '-mod=mod', GOCACHE: '/tmp/go-cache', GOPATH: '/Users/build/go',
+    COREPACK_HOME: '/tmp/corepack', npm_config_registry: 'https://registry.example', CI: '1',
+    GITHUB_TOKEN: 'ghp_secret', AWS_SECRET_ACCESS_KEY: 'aws-secret', NODE_OPTIONS: '--require evil.js',
+    SSH_AUTH_SOCK: '/tmp/ssh.sock', DB_PASSWORD: 'hunter2',
+    LWB_DESKTOP_BUILD_NUMBER: '7', DSH_DESKTOP_NPM_REGISTRY: 'https://registry.npmmirror.com', ELECTRON_MIRROR: 'https://m.example/',
+  })
+  for (const name of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'HTTPS_PROXY', 'GOFLAGS', 'GOCACHE', 'GOPATH', 'COREPACK_HOME', 'npm_config_registry', 'CI', 'LWB_DESKTOP_BUILD_NUMBER', 'DSH_DESKTOP_NPM_REGISTRY', 'ELECTRON_MIRROR']) {
+    assert.notEqual(environment[name], undefined, `${name} must survive the allowlist`)
+  }
+  for (const name of ['GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'NODE_OPTIONS', 'SSH_AUTH_SOCK', 'DB_PASSWORD']) {
+    assert.equal(environment[name], undefined, `${name} must not reach packaging children`)
+  }
 })
 
 test('an unsigned build drops release credentials but keeps the npm registry', () => {
@@ -208,4 +234,19 @@ test('an unsigned build drops release credentials but keeps the npm registry', (
      fixed it. */
   assert.equal(environment.DSH_DESKTOP_NPM_REGISTRY, 'https://registry.npmmirror.com')
   assert.deepEqual(unsignedPackagingEnvironment({}), {})
+})
+test('a non-empty artifact directory is refused instead of silently mixing two builds', async () => {
+  const { assertArtifactDirectoryEmpty } = await import('./package-inputs.mjs')
+  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const root = await mkdtemp(join(tmpdir(), 'lwb-artifacts-'))
+  try {
+    await assertArtifactDirectoryEmpty(join(root, 'missing')) // missing is fine
+    await mkdir(join(root, 'empty'))
+    await assertArtifactDirectoryEmpty(join(root, 'empty')) // empty is fine
+    await mkdir(join(root, 'used'))
+    await writeFile(join(root, 'used', 'stale.zip'), 'old')
+    await assert.rejects(assertArtifactDirectoryEmpty(join(root, 'used')), /非空|并发|清空/u)
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

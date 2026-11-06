@@ -490,9 +490,6 @@ export class SpokenVideoScheduleHost {
    * launch the same slot twice even though a round takes many minutes.
    */
   async startRun(paths, schedule, trigger) {
-    if ([...this.active.values()].some((run) => run.workspace === paths.workspace)) {
-      fail('SPOKEN_VIDEO_SCHEDULE_BUSY', '本工作区已有一轮自动化在执行，请等待其结束。')
-    }
     const runId = randomUUID()
     const triggeredAt = this.now()
     const steps = stepsForRun(schedule.depth, schedule.production.subtitleEnabled)
@@ -513,6 +510,14 @@ export class SpokenVideoScheduleHost {
       items: [],
     }
     await this.mutate(paths, (data) => {
+      /* The single-round check lives inside the same serialized section as the
+         record write: as a plain pre-check it raced a second trigger that
+         passed between the check and this.active.set, and both rounds then
+         ran concurrently (double billing, interleaved revisions). The loser
+         throws here, before any record is written. */
+      if ([...this.active.values()].some((run) => run.workspace === paths.workspace)) {
+        fail('SPOKEN_VIDEO_SCHEDULE_BUSY', '本工作区已有一轮自动化在执行，请等待其结束。')
+      }
       const item = data.schedules.find((candidate) => candidate.id === schedule.id)
       if (item) {
         item.lastRunAt = triggeredAt

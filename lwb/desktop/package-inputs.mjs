@@ -7,6 +7,7 @@
  * the clock), so the packaging runner can fail loudly before an
  * expensive build starts, and the decisions are unit-testable without a build.
  */
+import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** Edition names the Desktop manifest accepts. */
@@ -27,11 +28,19 @@ export const COMMERCIAL_PACKS_DIR = 'packs'
 export const ELECTRON_MIRROR_FALLBACK = 'https://cdn.npmmirror.com/binaries/electron/'
 
 /**
- * Variables an unsigned test build must not inherit from the operator's shell:
- * Apple notary and signing credentials, Windows signing credentials, and the
- * production update feed.
+ * Packaging children (pnpm, electron-builder, `npm ci`, `go build`) inherit an
+ * allowlist, not the operator's shell: anything holding release credentials,
+ * CI tokens or injection vectors (`NODE_OPTIONS`) stays out of reach of the
+ * dependency install scripts those children run.
  */
-const UNSIGNED_ENV_DENY = /^(?:DSH_DESKTOP_|APPLE_|CSC_|WIN_CSC_|DOWNLOAD_(?:TEST|PROD)_)/u
+const PACKAGING_ENV_ALLOW = [
+  /^(?:PATH|HOME|USER|LOGNAME|SHELL|TERM|TMPDIR|TEMP|TMP|PWD|CI)$/u,
+  /^(?:LANG|LANGUAGE|LC_[A-Z_]+)$/u,
+  /^(?:HTTP|HTTPS|NO|ALL)_PROXY$/u,
+  /^(?:http|https|no|all)_proxy$/u,
+  /^(?:XDG_[A-Z_]+|GO[A-Z_]*|COREPACK_[A-Z_]+|npm_config_.*|NPM_CONFIG_.*|PNPM_[A-Z_]+)$/u,
+  /^(?:LWB_|DSH_(?!DESKTOP_)|ELECTRON_)/u,
+]
 
 /**
  * The one `DSH_DESKTOP_` variable that carries a package *source* rather than a
@@ -56,7 +65,7 @@ export const NPM_REGISTRY_ENV = 'DSH_DESKTOP_NPM_REGISTRY'
  */
 export function unsignedPackagingEnvironment(environment) {
   return Object.fromEntries(Object.entries(environment).filter(([name]) => (
-    name === NPM_REGISTRY_ENV || !UNSIGNED_ENV_DENY.test(name)
+    name === NPM_REGISTRY_ENV || PACKAGING_ENV_ALLOW.some((pattern) => pattern.test(name))
   )))
 }
 
@@ -174,6 +183,21 @@ export function artifactDirectory(projectRoot, edition, target) {
 }
 
 /**
+ * Refuse to package into a directory that already holds output. The artifact
+ * path is fixed per edition and target, so two builds for the same pair —
+ * concurrent jobs, or a rerun after a failed one — used to interleave and
+ * produce a zip assembled from both runs' bytes.
+ * @param directory - artifact directory about to be written.
+ */
+export async function assertArtifactDirectoryEmpty(directory) {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(error => {
+    if (error.code === 'ENOENT') return []
+    throw error
+  })
+  if (entries.length) throw new Error(`产物目录非空（${directory}）：可能是上次构建的残留或另一个并发构建正在写入。请清空该目录后重试。`)
+}
+
+/**
  * Where electron-builder leaves the unpacked app of one run, plus the product
  * build manifest inside it. Deriving this from the target reports what the run
  * produced instead of whatever else appeared in the artifact directory.
@@ -275,11 +299,18 @@ export function resolveCommercialPackDir({ env, projectRoot, exists }) {
 export async function resolveElectronMirror({ env, version, probe, fallback = ELECTRON_MIRROR_FALLBACK }) {
   const configured = env.ELECTRON_MIRROR?.trim()
   if (configured) return { mirror: configured, source: 'ELECTRON_MIRROR' }
-  if (env.LWB_ELECTRON_MIRROR?.trim() === 'off') return { mirror: undefined, source: 'probing disabled' }
+  const mode = env.LWB_ELECTRON_MIRROR?.trim()
+  if (mode === 'off') return { mirror: undefined, source: 'probing disabled' }
   if (version === undefined) return { mirror: undefined, source: 'unknown Electron version' }
   if (await probe(releaseChecksumUrl(version))) return { mirror: undefined, source: 'release host' }
-  if (await probe(`${fallback}${version}/SHASUMS256.txt`)) return { mirror: fallback, source: 'mirror fallback' }
-  return { mirror: undefined, source: 'no reachable download source' }
+  /* No silent third-party fallback: the artifact and its SHASUMS256.txt would
+     both come from the mirror, so a poisoned mirror passes @electron/get's own
+     integrity check. Mirror use must be an explicit, informed choice. */
+  if (mode === 'auto') {
+    if (await probe(`${fallback}${version}/SHASUMS256.txt`)) return { mirror: fallback, source: 'mirror fallback (auto)' }
+    return { mirror: undefined, source: 'no reachable download source' }
+  }
+  return { mirror: undefined, source: 'release host unreachable' }
 }
 
 /**

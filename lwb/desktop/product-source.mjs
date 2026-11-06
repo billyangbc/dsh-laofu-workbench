@@ -80,3 +80,26 @@ export function replaceSnapshotFields(text, update) {
 export function serialiseSnapshotInputs(current, update) {
   return `${JSON.stringify(mergeSnapshotInputs(current ?? {}, update), null, 2)}\n`
 }
+
+/**
+ * Why publishing the Windows leg from this snapshot record would be wrong, or
+ * null when the record matches the checkout being released.
+ *
+ * The Windows artifact is built by the private runner from
+ * `.build/product-source.tar.gz`, never from this repository. Publishing it
+ * beside mac artifacts of one version while the snapshot came from another
+ * commit ships two different codebases under the same version number; an
+ * archive built with uncommitted tracked changes is just as unreproducible.
+ * @param record - `.build/inputs.json` contents, or null when unreadable.
+ * @param head - commit this release is cut from.
+ * @returns a human-readable problem, or null.
+ */
+export function snapshotProvenanceProblem(record, head) {
+  if (!record || typeof record !== 'object') return 'inputs.json 缺少快照溯源字段（无法确认 Windows 腿的构建来源）。'
+  if (typeof record.productSnapshotCommit !== 'string' || !record.productSnapshotCommit) return 'inputs.json 未记录 productSnapshotCommit。'
+  if (record.productSnapshotCommit !== head) {
+    return `产品源码快照过期：inputs.json 记录 ${record.productSnapshotCommit.slice(0, 12)}，当前检出于 ${String(head).slice(0, 12)}。请先执行 npm run snapshot:product 并重建 Windows 腿。`
+  }
+  if (record.includesLocalTrackedChanges === true) return '产品源码快照包含未提交的受跟踪改动，请从干净工作树重建快照。'
+  return null
+}

@@ -1419,6 +1419,23 @@ export class SpokenVideoContentStore {
           record.status = 'failed'; record.error = detail; record.completedAt = this.now(); record.elapsedMs = ms(record.startedAt, record.completedAt)
           changed = true
         }
+        /* A crash between the two mutations of changeCandidateSelection leaves
+           the candidate's selection in a transition state; the guard then
+           rejects every later attempt forever. No transition can survive a
+           restart, so reset them to the pre-transition stable state — both
+           re-select and re-deselect are idempotent against the project store. */
+        for (const record of data.generations) {
+          for (const candidate of record?.candidates || []) {
+            const state = candidate?.selection?.state
+            if (state !== 'activating' && state !== 'deactivating') continue
+            candidate.selection = {
+              ...candidate.selection,
+              state: state === 'activating' ? 'available' : 'selected',
+              error: '主机重启导致待写稿状态未完成，请重试本次操作。',
+            }
+            changed = true
+          }
+        }
         if (changed) await writeJson(generations, data)
       })
     }

@@ -31,6 +31,7 @@ import { pipeline } from 'node:stream/promises'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { snapshotProvenanceProblem } from '../lwb/desktop/product-source.mjs'
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PRODUCT = 'laofu-workbench'
@@ -438,6 +439,20 @@ async function publishAll({ version, channel, dryRun }) {
   console.log(`Verified all ${legs.length} legs of ${version} on ${channel}.`)
 }
 
+/** The Windows leg is built from a product-source snapshot, not this tree. */
+function verifyProductSnapshot(target) {
+  if (target !== 'win-x64') return
+  const inputs = text(process.env.LWB_RELEASE_SNAPSHOT_INPUTS)
+    ?? join(resolve(text(process.env.LWB_COMMERCIAL_PACK_DIR) ?? join(PROJECT_ROOT, '..', 'dsh-laofu-workbench-commercial')), '.build', 'inputs.json')
+  if (!existsSync(inputs)) fail(`Windows 腿的构建来源记录不存在：${inputs}。私有 runner 把溯源写在 .build/inputs.json；路径不同请设 LWB_RELEASE_SNAPSHOT_INPUTS。`)
+  let record = null
+  try { record = JSON.parse(readFileSync(inputs, 'utf8')) } catch (error) { fail(`无法读取快照溯源 ${inputs}：${error instanceof Error ? error.message : String(error)}`) }
+  const head = spawnSync('git', ['-C', PROJECT_ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+  if (head.status !== 0) fail('无法确定本次发布的提交（git rev-parse HEAD）。')
+  const problem = snapshotProvenanceProblem(record, head.stdout.trim())
+  if (problem !== null) fail(problem)
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -473,6 +488,7 @@ async function main() {
   }
   const target = text(values.target)
   if (target === undefined) fail('Pass --target <name>, or --publish-all --version <x.y.z>')
+  verifyProductSnapshot(target)
   // A typed version would silently do nothing here — the target's version comes
   // from its own build report, because that is what the artifact actually is.
   // Accepting the flag and ignoring it is how someone publishes 0.1.8 thinking

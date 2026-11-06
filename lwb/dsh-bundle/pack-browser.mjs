@@ -130,11 +130,42 @@ export async function browserStatus() {
   }
 }
 
-async function alive(endpoint) {
+async function alive(endpoint, expectedFingerprint = null) {
+  const browser = await versionOf(endpoint)
+  if (!browser) return false
+  if (expectedFingerprint && browser !== expectedFingerprint) return false
+  return true
+}
+
+/**
+ * What a Chromium debugging endpoint says it is, or null for anything else.
+ *
+ * The port file records this at launch and it is checked before reuse: a port
+ * the OS recycled to some other local HTTP service must not be connected to
+ * as if it were the character's signed-in browser. Chrome's CDP port has no
+ * authentication, so this only separates "ours" from "not ours" -- it is not
+ * a defense against a local process that deliberately spoofs the reply.
+ */
+async function versionOf(endpoint) {
   try {
     const response = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(1_500) })
-    return response.ok
-  } catch { return false }
+    if (!response.ok) return null
+    const body = await response.json().catch(() => null)
+    const browser = typeof body?.Browser === 'string' ? body.Browser.trim() : ''
+    return browser || null
+  } catch { return null }
+}
+
+/** Port file format: `<port>\n<Browser fingerprint>\n`; the second line is absent in legacy files. */
+export function formatPortFile(port, fingerprint = null) {
+  return fingerprint ? `${port}\n${fingerprint}\n` : `${port}\n`
+}
+
+export function parsePortFile(text) {
+  const [portLine, ...rest] = String(text ?? '').split('\n')
+  const port = Number(portLine.trim())
+  const fingerprint = rest.map(line => line.trim()).find(Boolean) || null
+  return { port: Number.isInteger(port) && port > 1024 && port < 65536 ? port : null, fingerprint }
 }
 
 function freePort() {
@@ -158,30 +189,35 @@ function freePort() {
  */
 async function portOf(dir) {
   const file = join(dir, PORT_FILE)
-  const stored = Number((await readFile(file, 'utf8').catch(() => '')).trim())
-  if (Number.isInteger(stored) && stored > 1024 && stored < 65536) return stored
+  const stored = parsePortFile(await readFile(file, 'utf8').catch(() => ''))
+  if (stored.port) return { port: stored.port, fingerprint: stored.fingerprint }
   const port = await freePort()
   await mkdir(dir, { recursive: true })
-  await writeFile(file, `${port}\n`, 'utf8')
-  return port
+  await writeFile(file, formatPortFile(port), { mode: 0o600 })
+  return { port, fingerprint: null }
 }
 
 /**
  * The dedicated browser for one profile directory, running.
  * @param dir - absolute directory the profile lives under.
  * @param options.url - page to open when it has to be launched (e.g. a login page).
+ * @param options.launchWaitMs - how long to wait for the debugging port (tests shorten this).
  * @returns `{ endpoint, launched }`.
  */
-export async function ensureDedicated(dir, { url = 'about:blank', chromium = findChromium() } = {}) {
+export async function ensureDedicated(dir, { url = 'about:blank', chromium = findChromium(), launchWaitMs = LAUNCH_WAIT_MS } = {}) {
   if (!chromium) throw new Error('这台电脑上没有找到 Chrome 或 Edge。')
   const root = resolve(dir)
-  let port = await portOf(root)
+  const recorded = await portOf(root)
+  let port = recorded.port
   let endpoint = `http://127.0.0.1:${port}`
-  if (await alive(endpoint)) return { endpoint, launched: false }
+  // Reuse only the browser we launched: same port AND same recorded identity.
+  // A mismatch (foreign service, or a Chrome update relaunching elsewhere on
+  // this port) falls through to the relaunch path below.
+  if (await alive(endpoint, recorded.fingerprint)) return { endpoint, launched: false }
   // Something else took the port since it was chosen: choose again.
   if (await portTaken(port)) {
     port = await freePort()
-    await writeFile(join(root, PORT_FILE), `${port}\n`, 'utf8')
+    await writeFile(join(root, PORT_FILE), formatPortFile(port), { mode: 0o600 })
     endpoint = `http://127.0.0.1:${port}`
   }
   const args = [
@@ -193,14 +229,22 @@ export async function ensureDedicated(dir, { url = 'about:blank', chromium = fin
   if (process.platform === 'darwin' && chromium.app) {
     await run('open', ['-n', '-a', chromium.app, '--args', ...args])
   } else {
-    spawn(chromium.executable, args, { detached: true, stdio: 'ignore' }).unref()
+    // Fire-and-forget: a missing binary surfaces through the alive poll as a
+    // launch timeout, and an unhandled 'error' event here would take the host
+    // down instead.
+    spawn(chromium.executable, args, { detached: true, stdio: 'ignore' }).on('error', () => {}).unref()
   }
-  const deadline = Date.now() + LAUNCH_WAIT_MS
+  const deadline = Date.now() + launchWaitMs
   while (Date.now() < deadline) {
-    if (await alive(endpoint)) return { endpoint, launched: true }
+    if (await alive(endpoint)) {
+      // Record who answered so the next activation can tell this browser from
+      // whatever else might end up on the port.
+      await writeFile(join(root, PORT_FILE), formatPortFile(port, await versionOf(endpoint)), { mode: 0o600 })
+      return { endpoint, launched: true }
+    }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 300))
   }
-  throw new Error(`${chromium.name} 没有在 ${LAUNCH_WAIT_MS / 1000} 秒内打开调试端口。`)
+  throw new Error(`${chromium.name} 没有在 ${launchWaitMs / 1000} 秒内打开调试端口。`)
 }
 
 function portTaken(port) {

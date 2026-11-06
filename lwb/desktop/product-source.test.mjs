@@ -99,3 +99,13 @@ test('a record missing a field is reported instead of half-patched', () => {
   assert.match(serialiseSnapshotInputs(undefined, UPDATE), /"productSnapshotCommit": "7092f75f9a14e87cb0b49adc1b6c1bc23ca10eda"/u)
   assert.match(serialiseSnapshotInputs({ mode: 'unsigned-release' }, UPDATE), /"mode": "unsigned-release"/u)
 })
+
+test('the Windows leg refuses a stale or dirty product-source snapshot', async () => {
+  const { snapshotProvenanceProblem } = await import('./product-source.mjs')
+  const head = 'a'.repeat(40)
+  assert.equal(snapshotProvenanceProblem({ productSnapshotCommit: head, includesLocalTrackedChanges: false }, head), null)
+  assert.match(String(snapshotProvenanceProblem({ productSnapshotCommit: 'b'.repeat(40), includesLocalTrackedChanges: false }, head)), /过期/u)
+  assert.match(String(snapshotProvenanceProblem({ productSnapshotCommit: head, includesLocalTrackedChanges: true }, head)), /未提交/u)
+  assert.match(String(snapshotProvenanceProblem(null, head)), /缺少/u)
+  assert.match(String(snapshotProvenanceProblem({}, head)), /未记录/u)
+})

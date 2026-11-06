@@ -36,7 +36,14 @@ const report = {
   // decided by the build record, and that is `release` itself. A `-test.N`
   // build reports false because it genuinely will not consult the channel —
   // reporting false for a release would be the opposite mistake.
-  unsigned: true, portable: true, notarized: false, autoUpdate: build.release,
+  // Signing state is derived from the artifact names this script accepts: the
+  // guard above refuses anything not marked `-unsigned`, so a signed flow must
+  // bring its own collector instead of inheriting a hardcoded `notarized: false`
+  // that would silently misreport it.
+  unsigned: files.every(file => file.includes('-unsigned')),
+  portable: files.every(file => file.includes('-portable')),
+  notarized: false,
+  autoUpdate: build.release,
   workflowCommit: process.env.GITHUB_SHA ?? null, upstream, artifacts: records,
   runner: process.env.RUNNER_NAME ?? null,
   packagedPackAcceptance: true,

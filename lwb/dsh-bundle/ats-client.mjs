@@ -6,9 +6,10 @@ const DEFAULT_BASE_URL = 'https://link.scitiger.cn'
 function text(value) { return typeof value === 'string' && value.trim() ? value.trim() : undefined }
 function normalizeBaseUrl(value) {
   const base = text(value) || DEFAULT_BASE_URL
-  const url = new URL(base)
-  if (url.protocol !== 'https:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') throw new Error('LWB ATS 地址必须使用 HTTPS。')
-  return url.href.replace(/\/$/u, '')
+  let url
+  try { url = new URL(base) } catch { return { url: DEFAULT_BASE_URL, problem: `「${base}」无法解析为 URL` } }
+  if (url.protocol !== 'https:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') return { url: DEFAULT_BASE_URL, problem: `「${url.href}」必须使用 HTTPS（本机地址除外）` }
+  return { url: url.href.replace(/\/$/u, ''), problem: null }
 }
 function errorWithCode(message, code, status) { const error = new Error(message); error.code = code; if (status) error.status = status; return error }
 
@@ -53,7 +54,13 @@ export class LwbAtsClient {
   constructor({ credentials, fetch = globalThis.fetch, baseUrl, deviceId, deviceName } = {}) {
     if (!credentials) throw new Error('LWB ATS 客户端缺少凭据服务。')
     if (typeof fetch !== 'function') throw new Error('LWB ATS 客户端缺少网络服务。')
-    this.credentials = credentials; this.fetch = fetch; this.baseUrl = normalizeBaseUrl(baseUrl)
+    this.credentials = credentials; this.fetch = fetch
+    /* A malformed LWB_ATS_URL used to throw here, which failed the bundle's
+       apply and took the whole shell (navigation, packs, settings) with it.
+       Degrade instead: the account service names its problem on every call,
+       everything else keeps working. */
+    const normalized = normalizeBaseUrl(baseUrl)
+    this.baseUrl = normalized.url; this.baseUrlProblem = normalized.problem
     this.deviceId = text(deviceId) || randomUUID(); this.deviceName = text(deviceName) || 'LWB'; this.refreshing = null
     this.generation = 0; this.serviceAbort = new AbortController(); this.listeners = new Set(); this.catalogCache = null; this.bootstrapping = null; this.credentialWrites = Promise.resolve()
   }
@@ -78,6 +85,7 @@ export class LwbAtsClient {
   }
   async clearSession() { this.invalidateServices(); const generation = this.generation; await this.mutateCredentials(() => Promise.all([this.credentials.unset(SESSION_REF), this.credentials.unset(SERVICE_REF)])); this.changed(); return generation }
   async raw(path, { method = 'GET', body, accessToken } = {}) {
+    if (this.baseUrlProblem) throw errorWithCode(`LWB 账号服务地址无效：${this.baseUrlProblem}。账号与计费功能不可用，请修正 LWB_ATS_URL 后重启工作台。`, 'LWB_ATS_URL_INVALID')
     const response = await this.fetch(`${this.baseUrl}${path}`, { method, redirect: 'error', signal: AbortSignal.timeout(30000), headers: { accept: 'application/json', ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
     let payload; try { payload = await response.json() } catch { payload = undefined }
     if (!response.ok) { const message = text(payload?.message) || text(payload?.error) || `ATS 请求失败（${response.status}）。`; throw errorWithCode(message, response.status === 401 ? 'LWB_ATS_UNAUTHORIZED' : 'LWB_ATS_REQUEST_FAILED', response.status) }
@@ -95,6 +103,9 @@ export class LwbAtsClient {
     try { return await work } finally { if (this.refreshing === work) this.refreshing = null }
   }
   async request(path, options = {}, retry = true) {
+    // Before the session lookup: a broken base URL is the louder fact, and the
+    // session check would otherwise mask it with "请先登录".
+    if (this.baseUrlProblem) throw errorWithCode(`LWB 账号服务地址无效：${this.baseUrlProblem}。账号与计费功能不可用，请修正 LWB_ATS_URL 后重启工作台。`, 'LWB_ATS_URL_INVALID')
     const generation = this.generation
     const session = await this.readSession(); this.assertGeneration(generation); if (!session) throw errorWithCode('请先登录 LWB 账号。', 'LWB_ATS_NOT_AUTHENTICATED')
     try { const value = await this.raw(path, { ...options, accessToken: session.accessToken }); this.assertGeneration(generation); return value } catch (error) {

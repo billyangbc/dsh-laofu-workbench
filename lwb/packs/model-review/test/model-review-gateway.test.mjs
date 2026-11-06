@@ -43,24 +43,67 @@ test('start accepts API Key models after configuration, but rejects stale and du
   assert.equal(created(), 1)
 })
 
-test('start launches every selected available model without a count limit', async () => {
-  const models = Array.from({ length: 30 }, (_, index) => ({ id: `model-${index}` }))
+test('start launches every selected model, but at most a few run at once', async () => {
+  const models = Array.from({ length: 12 }, (_, index) => ({ id: `model-${index}` }))
   const { gateway } = gatewayFor([{ id: 'ready', selectable: true, models }])
   const selected = models.map(model => ({ provider: 'ready', model: model.id, displayName: model.id }))
   let stored
   const launched = []
+  let inFlight = 0, peak = 0
+  let release
+  const gate = new Promise(resolve => { release = resolve })
   gateway.ctx.modelReviewStore.createTask = async ({ models }) => {
     stored = models
     return { id: 'task', runs: models.map((model, index) => ({ id: `run-${index}`, model })) }
   }
-  gateway.launchRun = async (_context, _taskId, run) => { launched.push(run.model) }
+  gateway.launchRun = async (_context, _taskId, run) => {
+    launched.push(run.model)
+    inFlight += 1; peak = Math.max(peak, inFlight)
+    await gate
+    inFlight -= 1
+  }
 
   await assert.rejects(gateway.start({ questionId: 'question', models: [] }), /至少选择一个模型/u)
-  await assert.rejects(gateway.start({ questionId: 'question' }), /至少选择一个模型/u)
+  const background = gateway.ctx.modelReviewScope.background
+  const settling = []
+  gateway.ctx.modelReviewScope.background = promise => { settling.push(promise) }
   const task = await gateway.start({ questionId: 'question', models: selected })
   assert.deepEqual(stored, selected)
-  assert.deepEqual(launched, selected)
-  assert.equal(task.runs.length, 30)
+  assert.equal(task.runs.length, 12)
+  /* 上限内的批次先行，其余排队：全部 12 个都会启动，但同时在跑的不超过上限。 */
+  await new Promise(resolve => setImmediate(resolve))
+  assert.ok(peak <= 4, `并发峰值 ${peak} 不得超过默认上限 4`)
+  assert.ok(launched.length >= 4, '第一批应立即启动')
+  release()
+  await Promise.allSettled(settling)
+  assert.deepEqual(launched.sort((a, b) => a.model.localeCompare(b.model, undefined, { numeric: true })), [...selected].sort((a, b) => a.model.localeCompare(b.model, undefined, { numeric: true })))
+  assert.equal(peak, 4, '应恰好打满上限')
+})
+
+test('a run whose session never idles times out, fails and cancels the session', async () => {
+  const { gateway } = gatewayFor([{ id: 'ready', selectable: true, models: [{ id: 'deepseek-flash' }] }])
+  process.env.LWB_MODEL_REVIEW_RUN_TIMEOUT_MS = '60'
+  const updates = []
+  let cancelled = 0, disposed = 0
+  const session = {
+    id: 'session',
+    async followup() {},
+    whenIdle: () => new Promise(() => {}),
+    cancel: () => { cancelled += 1 },
+    dispose: async () => { disposed += 1 },
+    async *follow() { yield { type: 'snapshot', cursor: 0, hasMore: false, records: [] } },
+  }
+  gateway.ctx.modelReviewScope.sessions = { create: async () => session }
+  gateway.ctx.modelReviewStore.updateRun = async (_taskId, _runId, patch) => { updates.push(patch) }
+  gateway.ctx.modelReviewStore.collectArtifacts = async () => []
+  const readRunProjections = (await import('../gateway.mjs')).readRunProjections
+  await gateway.launchRun({}, 'task', { id: 'run', model: { provider: 'ready', model: 'deepseek-flash' }, cwd: 'runs/task/run' }, 'prompt')
+  delete process.env.LWB_MODEL_REVIEW_RUN_TIMEOUT_MS
+  assert.equal(cancelled, 1, '超时必须取消会话回合')
+  assert.equal(disposed, 1, '超时后必须释放会话')
+  const failed = updates.find(patch => patch.status === 'failed')
+  assert.ok(failed, '超时的 run 必须以失败落账')
+  assert.match(failed.error, /超时|未完成/u)
 })
 
 test('launchRun saves the completed answer from the follow snapshot', async () => {

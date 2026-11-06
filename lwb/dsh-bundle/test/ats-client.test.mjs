@@ -193,3 +193,21 @@ test('orderStatus queries the authenticated order endpoint', async () => {
   assert.equal(calls[1][0], 'https://ats.example.test/api/orders/123')
   assert.equal(calls[1][1].headers.authorization, 'Bearer access')
 })
+
+test('an invalid LWB_ATS_URL degrades the account service instead of the whole shell', async () => {
+  const values = new Map()
+  const credentials = { resolve: async (key) => ({ value: values.get(key) }), set: async (key, value) => values.set(key, value), unset: async (key) => values.delete(key) }
+  const fetch = async url => { throw new Error(`unexpected request: ${url}`) }
+  /* 一个 typo 过去会在 bundle apply 时抛出，让三模块导航整体消失。现在构造必须成功。 */
+  let client
+  for (const bad of ['http://intranet.example.com', 'not a url at all', 'ftp://ats.example.com']) {
+    client = new LwbAtsClient({ credentials, fetch, baseUrl: bad })
+    await assert.rejects(client.status(), { code: 'LWB_ATS_URL_INVALID' })
+    await assert.rejects(client.login({ account: 'a', password: 'b' }), { code: 'LWB_ATS_URL_INVALID' })
+  }
+  assert.match(client.baseUrlProblem || '', /HTTPS|解析/u)
+  /* 恢复正确地址后同一客户端行为不受影响。 */
+  const healthy = new LwbAtsClient({ credentials, fetch: async () => response(200, sessionFor('7').user), baseUrl: 'https://ats.example.test' })
+  await healthy.writeSession(sessionFor('7'))
+  assert.equal((await healthy.status()).user.id, '7')
+})

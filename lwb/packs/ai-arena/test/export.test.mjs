@@ -227,3 +227,26 @@ test('坏帧阈值跟着内容走：动效大的片子不会被误判，坏帧�
   noisy[201] = 60
   assert.deepEqual(brokenFrames(noisy), [200], '同一片子里 60 的孤立尖峰仍然抓得到')
 })
+
+test('a hung render times out, fails the export and releases the channel', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'arena-export-timeout-')); t.after(() => rm(root, { recursive: true, force: true }))
+  const store = await new ArenaStore(root).init(), controller = new AbortController(), jobs = []
+  const match = await store.create({ ...fixture, id: undefined })
+  await store.update(match.id, value => { value.status = 'finished'; value.events = fixture.events })
+  process.env.LWB_ARENA_EXPORT_TIMEOUT_MS = '80'
+  t.after(() => { delete process.env.LWB_ARENA_EXPORT_TIMEOUT_MS })
+  const exporter = new ArenaExport({
+    store,
+    scope: { signal: controller.signal, background: promise => jobs.push(promise) },
+    render: (snapshot, directory, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new Error('render cancelled')))
+    }),
+  })
+  await exporter.start({ id: match.id })
+  await jobs[0]
+  const after = await store.get(match.id)
+  assert.equal(after.export.status, 'failed', '挂起的渲染必须以失败落账')
+  assert.match(after.export.error, /超时/u)
+  assert.equal(exporter.running.has(match.id), false, '超时后导出通道必须释放，可再次导出')
+  controller.abort()
+})

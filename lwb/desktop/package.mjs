@@ -11,7 +11,7 @@ import { desktopPnpmInvocation } from './toolchain.mjs'
 import { loadEditionManifest, resolveEdition } from './editions.mjs'
 import { assembleProductPayload } from './payload.mjs'
 import { relinkDarwinLibraries } from './darwin-library-paths.mjs'
-import { artifactDirectory, payloadInstallArguments, resolveHostTarget, resolveTargetArch, unsignedPackagingEnvironment } from './package-inputs.mjs'
+import { artifactDirectory, assertArtifactDirectoryEmpty, payloadInstallArguments, resolveHostTarget, resolveTargetArch, unsignedPackagingEnvironment } from './package-inputs.mjs'
 import { assembleLaunchPackage } from './launch-package.mjs'
 
 /**
@@ -222,6 +222,7 @@ const identity = {
   targetArch: arch,
   ...(unsigned ? { unsigned: true, version: buildVersion, output: artifactDirectory(LWB_RUNTIME.projectRoot, edition.name, resolveHostTarget(process.platform, arch)) } : {}),
 }
+if (unsigned) await assertArtifactDirectoryEmpty(identity.output)
 const config = join(stage, 'electron-builder.config.mjs')
 await writeFile(config, `export default await (await import(${JSON.stringify(new URL('./package-config.mjs', import.meta.url).href)})).createLwbPackageConfig(${JSON.stringify(payload)}, ${JSON.stringify(identity)})\n`)
 // The target architecture is explicit: the builder otherwise follows the

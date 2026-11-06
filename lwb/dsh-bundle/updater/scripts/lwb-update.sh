@@ -110,8 +110,26 @@ fi
 /usr/bin/xattr -dr com.apple.quarantine "$TARGET" >>"$LOG" 2>&1 || true
 
 log "relaunching $TARGET"
-if ! /usr/bin/open "$TARGET" >>"$LOG" 2>&1; then
-  log "relaunch failed; the new bundle is installed at $TARGET"
+/usr/bin/open "$TARGET" >>"$LOG" 2>&1 || log "open returned non-zero; checking whether the app came up anyway"
+
+# Keep the previous version until the new one proves it can run: a bundle that
+# fails to start must roll back, not leave the user with nothing (the Windows
+# launcher already waits for a ready signal and rolls back the same way).
+launch_ok=0
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+  if pgrep -f "$TARGET/Contents/MacOS/" >/dev/null 2>&1; then launch_ok=1; break; fi
+  attempt=$((attempt + 1))
+  sleep 0.3
+done
+if [ "$launch_ok" -ne 1 ]; then
+  log "the new build did not come up after 30s; restoring the previous version"
+  rm -rf "$TARGET" 2>/dev/null || true
+  if mv "$BACKUP" "$TARGET"; then
+    /usr/bin/open "$TARGET" >>"$LOG" 2>&1 || true
+    fail "新版本 30 秒内没有启动，已回滚到旧版本（$VERSION 未安装）。"
+  fi
+  fail "新版本没有启动，且无法恢复旧版本；旧版本仍在 $BACKUP。"
 fi
 
 rm -rf "$BACKUP" 2>/dev/null || true

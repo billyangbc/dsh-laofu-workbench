@@ -19,9 +19,10 @@ const xiangqiReply = (fromRow, fromCol, toRow, toCol, speech = '我先出动这�
 async function setup(t, complete, models = [{ id: 'black', name: 'Black' }, { id: 'white', name: 'White' }], hostOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), 'arena-test-'))
   t.after(() => rm(root, { recursive: true, force: true }))
-  const store = await new ArenaStore(root).init(), signal = new AbortController(), jobs = [], stops = [], sessions = new Map(), sessionEvents = []
+  const store = await new ArenaStore(root).init(), signal = new AbortController(), jobs = [], stops = [], sessions = new Map(), sessionEvents = [], createdOptions = [], prompts = []
   let sequence = 0
   const makeSession = options => {
+    createdOptions.push(options)
     const events = []
     const sessionOptions = { ...options }
     let pending = null, activeController = null, progressWaiters = []
@@ -34,6 +35,7 @@ async function setup(t, complete, models = [{ id: 'black', name: 'Black' }, { id
       updateOptions: next => Object.assign(sessionOptions, next),
       id: `session-${sessions.size + 1}`,
       followup: async prompt => {
+        prompts.push(prompt)
         session.started = true
         activeController = new AbortController()
         pending = Promise.resolve().then(() => complete({ ...sessionOptions, prompt }, activeController.signal, emitProgress))
@@ -68,7 +70,7 @@ async function setup(t, complete, models = [{ id: 'black', name: 'Black' }, { id
   const host = new ArenaHost({ store, games: new ArenaGames(), scope, turnDelayMs: 0, ...hostOptions })
   const start = config => host.start({ players: [{ provider: 'test', model: 'black' }, { provider: 'test', model: 'white' }], ...config })
   const settle = async () => { while (jobs.length) await jobs.shift() }
-  return { root, store, scope, host, start, settle, sessions, sessionEvents, setResponder: value => { complete = value }, stop: () => { signal.abort(); stops.forEach(fn => fn()) } }
+  return { root, store, scope, host, start, settle, sessions, sessionEvents, createdOptions, prompts, setResponder: value => { complete = value }, stop: () => { signal.abort(); stops.forEach(fn => fn()) } }
 }
 test('每局狼人杀按种子重新发牌，并把种子记进配置以便复现', async t => {
   const models = ['a', 'b', 'c', 'd', 'e', 'f'].map(id => ({ id, name: id }))
@@ -558,4 +560,105 @@ test('truncated Session reply continues in place, then pauses with accumulated u
   assert.equal(resumed.players[0].sessionId, sessionId)
   assert.equal(resumed.events.find(event => event.type === 'error').sessionId, match.players[0].sessionId)
   assert.equal(resumed.events.filter(event => event.type === 'request').at(-1).sessionId, resumed.players[0].sessionId)
+})
+
+test('会话失效被替换后必须重置 sessionSeq，替补会话的下一手不得落入 seq 死锁', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'arena-seqdeadlock-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const store = await new ArenaStore(root).init()
+  const games = new ArenaGames()
+  const catalog = [{ id: 'test', name: 'Test', models: [{ id: 'black', name: 'Black' }, { id: 'white', name: 'White' }] }]
+  /* 每个 DSH 会话有自己的 seq 空间，替补会话从 1 重新计数——死锁正源于此。 */
+  let callCount = 0, moveIndex = 0
+  const respond = async () => {
+    callCount += 1
+    if (callCount === 2) throw new Error('模拟服务错误：第一手后立即暂停。')
+    const index = moveIndex++
+    return { action: { row: Math.floor(index / 15) + 1, col: (index % 15) + 1 }, speech: `第 ${index + 1} 手。` }
+  }
+  const makeScope = resumeFails => {
+    const controller = new AbortController(), jobs = [], stops = []
+    let born = 0
+    const makeSession = () => {
+      let seq = 0
+      const events = []
+      return {
+        id: `replacement-${++born}`,
+        followup: async () => {},
+        whenIdle: async () => {
+          const move = await respond()
+          events.push({ seq: ++seq, type: 'user/message', data: { message: { content: [{ type: 'text', text: 'turn' }] } } })
+          events.push({ seq: ++seq, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: JSON.stringify(move) }] }, usage: { inputTokens: 1, outputTokens: 1 } } })
+          events.push({ seq: ++seq, type: 'turn/end', data: { reason: { kind: 'completed' } } })
+        },
+        page: async request => ({ records: events.filter(event => event.seq <= (request?.throughSeq ?? -1)).map(event => ({ type: 'event', event })), hasMore: false }),
+        follow: async function* (_, signal) {
+          yield { type: 'snapshot', cursor: events.at(-1)?.seq ?? -1, records: events.map(event => ({ type: 'event', event })) }
+          await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+        },
+        cancel: () => {},
+        dispose: async () => {},
+      }
+    }
+    return {
+      scope: {
+        signal: controller.signal,
+        onStop: fn => stops.push(fn),
+        background: job => jobs.push(job),
+        models: { list: async () => catalog },
+        sessions: {
+          create: async () => makeSession(),
+          resume: async id => { if (resumeFails) throw new Error(`会话 ${id} 已不存在（模拟 DSH 重启）。`); const session = makeSession(); session.id = id; return session },
+        },
+      },
+      controller, jobs, stops,
+    }
+  }
+  const waitFor = async (predicate, label) => {
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      const [match] = await store.list(true)
+      if (predicate(match)) return match
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    throw new Error(`等待超时：${label}`)
+  }
+
+  /* 第一阶段：黑方完成一手后，白方回合遇到服务错误，比赛自动暂停。 */
+  const first = makeScope(false)
+  const host = new ArenaHost({ store, games, scope: first.scope, turnDelayMs: 0 })
+  const started = await host.start({ players: [{ provider: 'test', model: 'black' }, { provider: 'test', model: 'white' }] })
+  const paused = await waitFor(match => match.status === 'paused' && match.state.moves.length >= 1, '第一手完成并暂停')
+  await Promise.allSettled(first.jobs.splice(0))
+  assert.ok(paused.players[0].sessionSeq > 0, '前置：黑方已带会话游标，重启后该游标即为过期值')
+
+  /* 第二阶段：模拟 DSH 重启——旧会话 resume 全部失效，替补会话 seq 从 1 重新计数。 */
+  const restarted = makeScope(true)
+  const host2 = new ArenaHost({ store, games, scope: restarted.scope, turnDelayMs: 0 })
+  await host2.control({ id: started.id, action: 'resume' })
+  const progressed = await waitFor(match => match.state.moves.length >= 2 || match.status === 'paused', '替补会话完成下一手')
+  await host2.control({ id: started.id, action: 'cancel' }).catch(() => {})
+  await Promise.allSettled(restarted.jobs.splice(0))
+  const settled = await store.get(started.id)
+  assert.equal(settled.events.filter(event => event.type === 'error' && /DSH 会话未返回可解析的选手回复/u.test(event.error)).length, 0,
+    '替补会话的回复必须可被读到，而不是永远落在过期 afterSeq 之后')
+  assert.ok(progressed.state.moves.length >= 2, '比赛必须推进到第二手')
+  assert.notEqual(settled.players[0].sessionId, paused.players[0].sessionId, '黑方换用替补会话')
+})
+
+test('续写催促不再重发整套规则，会话保持无工具预设（原生自动压缩的前提）', async t => {
+  const env = await setup(t, async () => ({ text: '{截断的半截回复', finish: { kind: 'stop' }, usage: { inputTokens: 1, outputTokens: 1 } }))
+  const started = await env.start({ gameId: 'gomoku' })
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline && env.prompts.length < 1) await new Promise(resolve => setTimeout(resolve, 5))
+  let good = 0
+  env.setResponder(async () => { const index = good++; return { text: JSON.stringify({ action: { row: Math.floor(index / 15) + 1, col: (index % 15) + 1 }, speech: '补全这一手。' }), finish: { kind: 'stop' }, usage: { inputTokens: 1, outputTokens: 1 } } })
+  await env.host.control({ id: started.id, action: 'pause' }).catch(() => {})
+  await env.settle()
+  /* 无工具预设是 DSH 原生自动压缩的开关，这一选择被钉住以防回归。 */
+  assert.equal(env.createdOptions[0].tools, 'none', '选手会话必须保持无工具预设')
+  const continuation = env.prompts.find(prompt => String(prompt).includes('上一条回复未完成'))
+  assert.ok(continuation, '应发生一次续写催促')
+  assert.doesNotMatch(String(continuation), /真实规则的 AI 竞技/u, '续写催促不得把整套规则系统指令再拼进历史')
+  assert.ok(String(continuation).length < 200, '续写催促应保持为一句话')
 })

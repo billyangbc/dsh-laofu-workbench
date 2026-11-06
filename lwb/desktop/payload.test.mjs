@@ -116,3 +116,34 @@ test('shipped keys are stable no matter where the pack is checked out', async (t
   }
   assert.deepEqual(await keysOf(first), await keysOf(second))
 })
+test('credential-like files never ship and every skip is reported', async (t) => {
+  const root = await fixtureProject(t)
+  // 仓库树或私有包 checkout 里可能存在的凭据形态：根 .env、变体、密钥材料、
+  // 命名含 secret/credential 的文件与 .npmrc（可能带 registry token）。
+  await writeFileAt(root, 'lwb/dsh-bundle/.env')
+  await writeFileAt(root, 'lwb/dsh-bundle/.env.local')
+  await writeFileAt(root, 'lwb/packs/pack-one/keys/server.pem')
+  await writeFileAt(root, 'lwb/packs/pack-one/keys/server.key')
+  await writeFileAt(root, 'lwb/packs/pack-one/secrets.json')
+  await writeFileAt(root, 'lwb/packs/pack-one/.npmrc')
+  const payload = join(root, 'payload')
+  const result = await assembleProductPayload({
+    projectRoot: root,
+    edition: { packs: [{ id: 'pack-one', source: join(root, 'lwb', 'packs', 'pack-one') }] },
+    payload,
+  })
+  const files = await listFiles(payload)
+  for (const banned of ['.env', '.env.local', 'server.pem', 'server.key', 'secrets.json', '.npmrc']) {
+    assert.ok(!files.some(file => file.endsWith(banned)), `${banned} must not ship, got ${files.join(', ')}`)
+  }
+  assert.ok(files.includes('lwb/packs/pack-one/index.mjs'), '正常业务文件仍然随包发行')
+  const skipped = (result?.skipped || []).map(String).sort()
+  assert.deepEqual(skipped, [
+    'lwb/dsh-bundle/.env',
+    'lwb/dsh-bundle/.env.local',
+    'packs/pack-one/.npmrc',
+    'packs/pack-one/keys/server.key',
+    'packs/pack-one/keys/server.pem',
+    'packs/pack-one/secrets.json',
+  ], '每个被跳过的凭据文件都要以构建键出现在报告里，便于人工核对来源')
+})

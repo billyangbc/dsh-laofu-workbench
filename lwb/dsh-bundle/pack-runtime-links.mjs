@@ -1,4 +1,5 @@
-import { cp, lstat, mkdir, readFile, readlink, realpath, rm, symlink, unlink } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LWB_RUNTIME, lwbProfilePath } from './runtime-config.mjs'
@@ -33,6 +34,27 @@ function runtimePackPath(pack) {
   return join(root, id)
 }
 
+const SOURCE_DIGEST_FILE = '.lwb-source-digest'
+const copyFilter = (source) => !source.endsWith(`${sep}node_modules`) && !source.includes(`${sep}node_modules${sep}`)
+
+/** Digest of the shipped part of a pack source tree, node_modules excluded. */
+async function sourceDigest(root) {
+  const digest = createHash('sha256')
+  const walk = async directory => {
+    const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name, 'en'))
+    for (const entry of entries) {
+      const path = join(directory, entry.name)
+      if (!copyFilter(path)) continue
+      const key = path.slice(root.length + 1)
+      if (entry.isSymbolicLink()) digest.update(`link:${key}\u0000${await readlink(path)}\u0000`)
+      else if (entry.isDirectory()) await walk(path)
+      else if (entry.isFile()) { digest.update(`file:${key}\u0000`); digest.update(await readFile(path)); digest.update('\u0000') }
+    }
+  }
+  await walk(root)
+  return digest.digest('hex')
+}
+
 /**
  * Copy a capability pack into the writable product area when its source is
  * shipped inside an immutable Desktop application resource tree. The copy is
@@ -43,13 +65,17 @@ async function preparePackSource(pack) {
   if (target === undefined || resolve(target) === resolve(pack.source)) return pack.source
   const existingTarget = await realpath(target).catch(error => { if (error.code !== 'ENOENT') throw error })
   if (existingTarget === await realpath(pack.source)) return target
+  /* The copied tree used to be rebuilt (rm + recursive cp) on every mount,
+     which made each activation re-copy the whole pack. Keep the copy for as
+     long as the source digest says nothing shipped has changed. */
+  const digest = await sourceDigest(pack.source)
+  const recorded = (await readFile(join(target, SOURCE_DIGEST_FILE), 'utf8').catch(() => '')).trim()
+  if (recorded === digest) return target
   await mkdir(dirname(target), { recursive: true })
   await rm(target, { recursive: true, force: true })
-  await cp(pack.source, target, {
-    recursive: true,
-    dereference: false,
-    filter: (source) => !source.endsWith(`${sep}node_modules`) && !source.includes(`${sep}node_modules${sep}`),
-  })
+  await cp(pack.source, target, { recursive: true, dereference: false, filter: copyFilter })
+  // Recorded only after a complete copy: a torn copy must look stale next time.
+  await writeFile(join(target, SOURCE_DIGEST_FILE), `${digest}\n`)
   return target
 }
 

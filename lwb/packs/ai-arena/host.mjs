@@ -177,6 +177,11 @@ export class ArenaHost {
         // keeps the match recoverable while preserving the old session in audit.
         if (signal.aborted) throw error
         session = await this.scope.sessions.create(options)
+        // The replacement starts its own event sequence from zero. Keeping the
+        // stale cursor would push the next turn's afterSeq boundary past every
+        // event the new session can ever emit, so each resume would call the
+        // model, find no reply and pause again until the seq catches up.
+        await this.store.update(match.id, value => { value.players[player].sessionSeq = 0 })
       }
     } else {
       session = await this.scope.sessions.create(options)
@@ -189,7 +194,7 @@ export class ArenaHost {
     return session
   }
 
-  async executeDecisionTurn(session, prompt, { afterSeq, signal, progress, id, turnId, player, gameId = 'gomoku', system = SYSTEM } = {}) {
+  async executeDecisionTurn(session, prompt, { afterSeq, signal, progress, id, turnId, player, gameId = 'gomoku' } = {}) {
     let currentPrompt = prompt
     let cursor = Number.isSafeInteger(afterSeq) ? afterSeq : -1
     let usage = null
@@ -214,7 +219,9 @@ export class ArenaHost {
           sessionSeq: response.sessionSeq, error: parseError?.message || null })
       })
       cursor = Number.isSafeInteger(response.sessionSeq) ? response.sessionSeq : cursor
-      currentPrompt = `上一条回复未完成或格式不合法。请立即完成当前回合，不要重复分析。${system}`
+      /* The rules already live in the session's system prompt; re-appending the
+         full system text here only grew the history on every continuation. */
+      currentPrompt = '上一条回复未完成或格式不合法。请立即完成当前回合，不要重复分析。'
     }
     if (usage) response = { ...response, usage }
     if (continuations) response = { ...response, continuationCount: continuations }
@@ -294,7 +301,10 @@ export class ArenaHost {
         }
         try {
           session = await this.playerSession(match, player, callSignal)
-          await this.store.update(id, value => {
+          // Rebind to the returned snapshot: a replacement session also resets
+          // players[player].sessionSeq there, and afterSeq below must see 0
+          // instead of the stale cursor from the top-of-loop read.
+          match = await this.store.update(id, value => {
             const request = value.events.find(event => event.type === 'request' && event.turnId === turnId)
             if (request) { request.sessionId = session.id; request.contextMode = 'current-position' }
             if (value.activeTurn?.turnId === turnId) value.activeTurn.sessionId = session.id
@@ -309,7 +319,6 @@ export class ArenaHost {
             turnId,
             player,
             gameId: match.game.id,
-            system: match.config.system,
           })
           response = { ...response, sessionId: session.id }
           if (response.finish?.kind !== 'stop' && !(response.finish?.kind === 'cancelled' && signal.aborted)) {

@@ -1000,3 +1000,31 @@ test('polish mode needs a saved script and analyzeScript produces a report', asy
   assert.equal(report.artifactType, 'script_quality_report')
   assert.ok(typeof report.qualityScore === 'number')
 })
+
+test('重启恢复会把卡在 activating/deactivating 的候选选择重置为可重试状态', async (t) => {
+  const { workspace, store } = await setup(t)
+  /* 崩溃窗口留下的中间态：记录本身已完成，但候选的 selection 子状态
+     停在过渡态。恢复前这会永久拒绝该候选的一切后续操作。 */
+  const file = join(workspace, 'data', 'topic-generations.json')
+  await mkdir(join(workspace, 'data'), { recursive: true })
+  const record = {
+    id: '11111111-1111-4111-8111-111111111111',
+    status: 'completed',
+    createdAt: '2026-08-31T01:02:03.000Z',
+    completedAt: '2026-08-31T01:02:03.000Z',
+    account: null,
+    candidates: [
+      { id: '22222222-2222-4222-8222-222222222222', title: '卡在加入中的候选', angle: null, selection: { state: 'activating' } },
+      { id: '33333333-3333-4333-8333-333333333333', title: '卡在移出中的候选', angle: null, selection: { state: 'deactivating', projectId: '44444444-4444-4444-8444-444444444444' } },
+      { id: '55555555-5555-4555-8555-555555555555', title: '正常候选', angle: null, selection: { state: 'selected', projectId: '66666666-6666-4666-8666-666666666666' } },
+    ],
+  }
+  await writeFile(file, JSON.stringify({ schemaVersion: 1, generations: [record] }))
+  await store.recoverInterruptedTopicGenerations()
+  const recovered = JSON.parse(await readFile(file, 'utf8')).generations[0].candidates
+  assert.equal(recovered[0].selection.state, 'available', 'activating 应回退到 available 允许重试')
+  assert.ok(/重启/.test(recovered[0].selection.error || ''), '回退要留下可读的错误说明')
+  assert.equal(recovered[1].selection.state, 'selected', 'deactivating 应回退到 selected 允许重试')
+  assert.ok(/重启/.test(recovered[1].selection.error || ''))
+  assert.equal(recovered[2].selection.state, 'selected', '稳态选择不受影响')
+})

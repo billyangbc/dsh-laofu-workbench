@@ -197,7 +197,9 @@ export function reportMarkdown(match) {
   })].join('\n')
 }
 export class ArenaExport {
-  constructor({ store, scope, render = renderVideo }) { Object.assign(this, { store, scope, render }); this.running = new Set() }
+  /** Wall-clock budget for one export. A hung Chrome/Remotion used to leave the
+   * channel occupied forever (status "running", no retry without a restart). */
+  constructor({ store, scope, render = renderVideo, timeoutMs = exportTimeoutMs() }) { Object.assign(this, { store, scope, render, timeoutMs }); this.running = new Set() }
   async start({ id, orientation = 'landscape', secondsPerMove = 3, withAudio = false }) {
     if (!['landscape', 'portrait'].includes(orientation) || !Number.isInteger(secondsPerMove) || secondsPerMove < 2 || secondsPerMove > 8) throw new Error('视频导出设置无效。')
     if (typeof withAudio !== 'boolean') throw new Error('视频导出设置无效。')
@@ -220,24 +222,33 @@ export class ArenaExport {
     } catch (error) { this.running.delete(id); throw error }
     if (snapshot.export?.status === 'succeeded') { this.running.delete(id); return snapshot }
     const key = snapshot.export.cacheKey, fileName = videoFileName(key)
+    /* Everything below shares one wall-clock budget: a hung Chrome or Remotion
+       must fail the export and release the channel instead of occupying it
+       until the next workbench restart. */
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs)
+    const scopeSignal = this.scope.signal
+    const signal = scopeSignal instanceof AbortSignal ? AbortSignal.any([scopeSignal, timeoutSignal]) : timeoutSignal
     this.scope.background((async () => {
       try {
         let audio = null
         if (withAudio) {
           audio = await synthesizeSpeech(snapshot, this.store.directory(id), {
-            scope: this.scope, signal: this.scope.signal,
+            scope: this.scope, signal,
             onProgress: ({ done, total }) => this.store.update(id, match => { if (match.export?.status === 'running') match.export = { ...match.export, phase: 'speech', speechDone: done, speechTotal: total } }),
           })
           await this.store.update(id, match => { if (match.export?.status === 'running') match.export = { ...match.export, phase: 'render' } })
         }
-        await this.render(snapshot, this.store.directory(id), { orientation, secondsPerMove, audio, signal: this.scope.signal, fileName })
+        await this.render(snapshot, this.store.directory(id), { orientation, secondsPerMove, audio, signal, fileName })
         const bytes = await artifactBytes(this.store.directory(id), fileName)
         await this.commit(id, key, { kind: 'video', file: fileName, bytes, orientation, secondsPerMove, withAudio })
         await dropLegacy(this.store.directory(id), `${orientation}.mp4`, fileName)
       } catch (error) {
         /* 只在还处于「进行中」时标失败：万一落账已经成功（例如清理旧产物抛错），
            不能把一份已经渲染好的成片改写成失败。 */
-        await this.store.update(id, match => { if (match.export?.status === 'running') match.export = { ...match.export, status: 'failed', error: error.message } })
+        const message = timeoutSignal.aborted && !(scopeSignal?.aborted)
+          ? `视频导出超时（预算 ${this.timeoutMs} 毫秒），已停止；可重试导出。`
+          : error.message
+        await this.store.update(id, match => { if (match.export?.status === 'running') match.export = { ...match.export, status: 'failed', error: message } })
       } finally { this.running.delete(id) }
     })())
     return snapshot
@@ -457,6 +468,12 @@ export async function renderVideo(match, directory, { orientation, secondsPerMov
     await rm(temporary, { force: true })
     await rm(join(directory, `${stem}.silent.mp4`), { force: true })
   }
+}
+
+/** Export wall-clock budget, overridable for tests via the environment. */
+export function exportTimeoutMs(environment = process.env) {
+  const raw = Number(environment.LWB_ARENA_EXPORT_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 45 * 60_000
 }
 
 /** 把每一段配音按该手的起始时间铺到一条音轨上，再贴进无声成片。
