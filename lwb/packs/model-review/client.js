@@ -1958,8 +1958,9 @@ ${closed}
             h(Chip, { tone: statusTone(task.status) }, statusText(task.status)),
             h('span', { className: 'mr-num' }, `${task.runs.length} 个模型`),
             h('span', { className: 'mr-num' }, `用时 ${durationText(taskDuration(task))}`),
-            task.runs.some(run => answerChars(run.answer) > 0)
-              ? h('span', { className: 'mr-num' }, `回答 ${charText(task.runs.reduce((sum, run) => sum + answerChars(run.answer), 0))}`)
+            /* The list RPC no longer carries answer text; each run carries its size. */
+            task.runs.some(run => (run.answerChars ?? answerChars(run.answer)) > 0)
+              ? h('span', { className: 'mr-num' }, `回答 ${charText(task.runs.reduce((sum, run) => sum + (run.answerChars ?? answerChars(run.answer)), 0))}`)
               : h('span', { className: 'mr-num' }, '无快照')))));
       /** The one place the report is asked for; it stays visible while the list scrolls. */
       const pickBar = all.length ? h('div', { className: 'mr-pickbar' },

@@ -92,6 +92,30 @@ async function walkArtifacts(root, relative, depth, out) {
   }
 }
 
+/**
+ * Plain-text length of a saved answer snapshot, matching the page's own
+ * answerText semantics. The index carries this number instead of the answer
+ * itself: `evaluations.json` is rewritten on every run update, and shipping
+ * every model's full reply inside it turned one status flip into a
+ * whole-history rewrite (and a multi-megabyte list RPC).
+ */
+function answerCharCount(answer) {
+  const content = answer?.message?.content ?? answer?.content ?? answer?.text
+  if (typeof content === 'string') return content.trim().length
+  if (!Array.isArray(content)) return 0
+  return content.map(item => typeof item === 'string' ? item : item?.text || '').join('').trim().length
+}
+
+/** The index copy of one run: same facts, the answer replaced by its size. */
+function slimRunForIndex(run) {
+  const { answer, ...rest } = run
+  return { ...rest, answerChars: answerCharCount(answer) }
+}
+
+function slimTaskForIndex(task) {
+  return { ...task, runs: (task.runs || []).map(slimRunForIndex) }
+}
+
 export class ModelReviewStore {
   constructor(workspacePath) {
     this.workspacePath = workspacePath
@@ -115,21 +139,32 @@ export class ModelReviewStore {
     const tasks = await this.tasks()
     let changed = false
     for (const task of tasks) {
+      // Recovery and the artifacts-unavailable flag mutate the full per-task
+      // record: the index copy no longer carries answer text, and task(id)
+      // reads the full file, so flags that used to live only in the index must
+      // be persisted there too.
+      const record = (await json(join(this.root, 'evaluations', task.id, 'task.json'), null)) || task
+      let dirty = false
       // Runs recorded before per-run directories shared one workspace root, so
       // their files cannot be attributed to a model any more. Say so instead of
       // guessing: the history view reads this flag.
-      if (task.artifactsUnavailable !== true && task.runs?.some((run) => !run.cwd)) {
-        task.artifactsUnavailable = true
+      if (record.artifactsUnavailable !== true && record.runs?.some((run) => !run.cwd)) {
+        record.artifactsUnavailable = true
+        dirty = true
+      }
+      if (['queued', 'running'].includes(record.status) || record.runs?.some((run) => ['queued', 'running'].includes(run.status))) {
+        const now = new Date().toISOString()
+        for (const run of record.runs) {
+          if (['queued', 'running'].includes(run.status)) Object.assign(run, { status: 'failed', error: '工作台重启时任务尚未完成。', completedAt: now, updatedAt: now })
+        }
+        record.status = 'failed'; record.updatedAt = now
+        dirty = true
+      }
+      if (dirty) {
+        await save(join(this.root, 'evaluations', task.id, 'task.json'), record)
+        Object.assign(task, slimTaskForIndex(record))
         changed = true
       }
-      if (!['queued', 'running'].includes(task.status) && !task.runs?.some((run) => ['queued', 'running'].includes(run.status))) continue
-      const now = new Date().toISOString()
-      for (const run of task.runs) {
-        if (['queued', 'running'].includes(run.status)) Object.assign(run, { status: 'failed', error: '工作台重启时任务尚未完成。', completedAt: now, updatedAt: now })
-      }
-      task.status = 'failed'; task.updatedAt = now
-      await save(join(this.root, 'evaluations', task.id, 'task.json'), task)
-      changed = true
     }
     if (changed) await save(this.tasksPath, { schemaVersion: 1, tasks })
     return this
@@ -182,7 +217,15 @@ export class ModelReviewStore {
   }
   async tasks() { return (await json(this.tasksPath, { schemaVersion: 1, tasks: [] })).tasks || [] }
   async listTasks() { return (await this.tasks()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 100) }
-  async task(id) { const item = (await this.tasks()).find((candidate) => candidate.id === id); if (!item) fail('测评任务不存在。'); return item }
+  async task(id) {
+    // The full record lives in the per-task file; the index entry (without
+    // answer text) is only the fallback for a missing or unreadable file.
+    const full = await json(join(this.root, 'evaluations', validTaskId(id), 'task.json'), null)
+    if (full) return full
+    const item = (await this.tasks()).find((candidate) => candidate.id === id)
+    if (!item) fail('测评任务不存在。')
+    return item
+  }
   async createTask({ question, models }) {
     return this.withTaskWrite(async () => {
       const id = randomUUID(); const createdAt = new Date().toISOString();
@@ -194,13 +237,13 @@ export class ModelReviewStore {
         task.runs.push({ id: runId, status: 'queued', model: structuredClone(model), sessionId: null, cwd: this.runCwd(id, runId), answer: null, error: null, createdAt, updatedAt: createdAt, artifacts: [] })
       }
       await save(join(this.root, 'evaluations', id, 'task.json'), task)
-      await save(join(this.tasksPath), { schemaVersion: 1, tasks: [task, ...(await this.tasks()).filter((item) => item.id !== id)] })
+      await save(join(this.tasksPath), { schemaVersion: 1, tasks: [slimTaskForIndex(task), ...(await this.tasks()).filter((item) => item.id !== id)] })
       return task
     })
   }
   async persistTask(task) {
     task.updatedAt = new Date().toISOString(); await save(join(this.root, 'evaluations', task.id, 'task.json'), task)
-    const list = await this.tasks(); await save(this.tasksPath, { schemaVersion: 1, tasks: [task, ...list.filter((item) => item.id !== task.id)] }); return task
+    const list = await this.tasks(); await save(this.tasksPath, { schemaVersion: 1, tasks: [slimTaskForIndex(task), ...list.filter((item) => item.id !== task.id)] }); return task
   }
   async updateTask(task) { return this.withTaskWrite(() => this.persistTask(task)) }
   async updateRun(taskId, runId, patch) {

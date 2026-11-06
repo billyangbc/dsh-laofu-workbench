@@ -5,6 +5,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ModelReviewStore } from '../model-review-store.mjs'
 
+function answerTextLength(answer) {
+  const content = answer?.message?.content ?? answer?.content ?? answer?.text
+  if (typeof content === 'string') return content.trim().length
+  if (!Array.isArray(content)) return 0
+  return content.map(item => typeof item === 'string' ? item : item?.text || '').join('').trim().length
+}
+
 async function setup(t) {
   const root = await mkdtemp(join(tmpdir(), 'model-review-store-'))
   t.after(() => rm(root, { recursive: true, force: true }))
@@ -334,4 +341,43 @@ test('the stored figures keep only what a report needs, and only when the host r
   assert.equal(bounded.toolMs, 12)
   assert.equal(bounded.asOfSeq, null)
   assert.equal(bounded.capturedAt.length > 0, true)
+})
+
+test('the index stays slim: answer text lives in task.json, the index carries its size', async (t) => {
+  const store = await setup(t)
+  const question = await store.saveQuestion({ title: '瘦身题目', prompt: '提示词' })
+  const task = await store.createTask({ question, models: [{ provider: 'official', model: 'a', displayName: 'A' }, { provider: 'ats', model: 'b', displayName: 'B' }] })
+  const longAnswer = { message: { content: [{ type: 'text', text: '一句很长的回答。'.repeat(200) }] } }
+  await store.updateRun(task.id, task.runs[0].id, { status: 'succeeded', answer: longAnswer })
+  await store.updateRun(task.id, task.runs[1].id, { status: 'failed', error: 'nope' })
+
+  /* 索引不再随每次更新重写全部回答正文。 */
+  const index = JSON.parse(await readFile(store.tasksPath, 'utf8'))
+  const indexed = index.tasks.find((item) => item.id === task.id)
+  assert.equal(indexed.runs[0].answer, undefined, '索引不得携带回答全文')
+  assert.equal(indexed.runs[0].answerChars, answerTextLength(longAnswer), '索引携带字符数供列表显示')
+  /* 全量数据仍在每任务文件里，详情与报告照旧。 */
+  const full = await store.task(task.id)
+  assert.deepEqual(full.runs[0].answer, longAnswer)
+  const listed = await store.listTasks()
+  assert.equal(listed.find((item) => item.id === task.id).runs[0].answerChars, answerTextLength(longAnswer))
+  assert.equal(listed.find((item) => item.id === task.id).runs[0].answer, undefined)
+})
+
+test('restart recovery reads full task records and never destroys saved answers', async (t) => {
+  const store = await setup(t)
+  const question = await store.saveQuestion({ title: '恢复题目', prompt: '提示词' })
+  const task = await store.createTask({ question, models: [{ provider: 'official', model: 'a', displayName: 'A' }] })
+  const answer = { message: { content: [{ type: 'text', text: '已完成任务的回答。' }] } }
+  await store.updateRun(task.id, task.runs[0].id, { status: 'succeeded', answer })
+  const second = await store.createTask({ question, models: [{ provider: 'official', model: 'b', displayName: 'B' }] })
+  await store.updateRun(second.id, second.runs[0].id, { status: 'running' })
+
+  /* 模拟重启：新实例 init() 把 running 记录判失败。 */
+  const reopened = await new ModelReviewStore(store.workspacePath).init()
+  const recovered = await reopened.task(task.id)
+  assert.deepEqual(recovered.runs[0].answer, answer, '恢复不得吞掉已完成任务的回答全文')
+  const fullFile = JSON.parse(await readFile(store.path(task.id, 'task.json'), 'utf8'))
+  assert.deepEqual(fullFile.runs[0].answer, answer, 'task.json 里的全文必须在恢复后原样保留')
+  assert.equal((await reopened.task(second.id)).status, 'failed')
 })
