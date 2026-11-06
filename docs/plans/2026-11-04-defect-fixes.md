@@ -78,6 +78,7 @@
 
 ## 实施中的范围调整（2026-11-05）
 
+- **#10（model-review 产物 symlink 逃逸）系原批次表的编号遗漏，已于 2026-11-06 补齐**（8ef4d07）：`readArtifact` 改 `lstat` + `O_NOFOLLOW`（登记产物被 run Agent 换链后拒绝读取并点名链接形态，校验与读取之间的竞态由 O_NOFOLLOW 关闭）；目录扫描侧 `Dirent.isFile()` 本就不认链接，无需改动。
 - **#14（IO 膨胀）model-review 半边已于 2026-11-06 补齐**（d9a4d6c）：`evaluations.json` 索引只带 `answerChars`，全文留在每任务 `task.json`，`task(id)` 直读全量文件；重启恢复与 artifactsUnavailable 旗标改写全量记录（旧实现以索引为权威，旗标必须同步落盘）；历史列表渲染预计算字数，旧索引行回退兼容。arena 半边（match.json 全量重写 × 1s 轮询）仍缓期：需要事件外置的数据布局迁移，属独立提案。
 - **#17（凭据 ref 归一化碰撞）核实为非缺陷**：`packCredentialRef` 的长度前缀取自归一后字符串，`my-key`(6) 与 `mykey`(5) 编码不同、互不覆盖；仅大小写变体共享槽位，而包作者惯例使用大写常量声明 ref，实际不可达。已用回归测试钉住现行为与旧形态可读性，不改存储格式（改动会让存量用户凭据需要迁移）。
 

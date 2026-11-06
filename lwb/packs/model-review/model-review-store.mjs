@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
+import { open, constants, lstat, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import { DEFAULT_MODEL_REVIEW_QUESTIONS } from './default-questions.mjs'
 
@@ -301,10 +301,19 @@ export class ModelReviewStore {
     const root = this.runPath(task.id, run.id)
     const absolute = resolve(root, path)
     if (absolute !== root && !absolute.startsWith(`${root}${sep}`)) fail('产物路径越界。')
-    const info = await stat(absolute).catch(() => null)
-    if (!info?.isFile()) fail('产物文件不存在。')
+    // A run Agent with full tools can swap a registered artifact for a symlink
+    // after it was scanned, so neither the directory walk above nor a plain
+    // stat() here means anything: lstat refuses the link form, and O_NOFOLLOW
+    // closes the race between that check and the read itself.
+    const info = await lstat(absolute).catch(() => null)
+    if (!info?.isFile()) fail(info?.isSymbolicLink() ? '产物文件不能是符号链接。' : '产物文件不存在。')
     if (info.size > ARTIFACT_READ_LIMIT) fail(`产物超过 ${Math.round(ARTIFACT_READ_LIMIT / 1048576)} MB，无法内联进报告。`)
-    return { path, bytes: info.size, text: await readFile(absolute, 'utf8') }
+    const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => null)
+    if (!handle) fail('产物文件不能是符号链接。')
+    try {
+      const text = await handle.readFile('utf8')
+      return { path, bytes: info.size, text }
+    } finally { await handle.close().catch(() => {}) }
   }
   /**
    * Record why one run has no figures, when that reason will never change.

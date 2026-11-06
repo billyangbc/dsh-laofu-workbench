@@ -381,3 +381,28 @@ test('restart recovery reads full task records and never destroys saved answers'
   assert.deepEqual(fullFile.runs[0].answer, answer, 'task.json 里的全文必须在恢复后原样保留')
   assert.equal((await reopened.task(second.id)).status, 'failed')
 })
+
+test('a registered artifact swapped for a symlink is refused, not followed', async (t) => {
+  const store = await setup(t)
+  const question = await store.saveQuestion({ title: '软链题目', prompt: '提示词' })
+  const task = await store.createTask({ question, models: [{ provider: 'official', model: 'a' }] })
+  const run = (await store.task(task.id)).runs[0]
+  const directory = store.runPath(task.id, run.id)
+  await mkdir(directory, { recursive: true })
+  await writeFile(join(directory, 'answer.md'), '# 回答')
+  await store.refreshArtifacts({ taskId: task.id, runId: run.id })
+  /* 带完整工具的 run Agent 可在登记后把产物换成指向宿主任意文件的软链：
+     stat() 会跟着走，把链目标的内容内联进报告带走。 */
+  const secret = join(store.workspacePath, 'secret.md')
+  await writeFile(secret, 'HOST SECRET')
+  const renamed = join(directory, 'answer.md.bak')
+  await (await import('node:fs/promises')).rename(join(directory, 'answer.md'), renamed)
+  await symlink(secret, join(directory, 'answer.md'))
+
+  await assert.rejects(store.readArtifact({ taskId: task.id, runId: run.id, path: 'answer.md' }), /符号链接|不是这次运行的产物记录/u)
+  /* 恢复为真实文件后照旧可读：拒绝的是链接形态，不是这个登记路径。 */
+  await (await import('node:fs/promises')).unlink(join(directory, 'answer.md'))
+  await (await import('node:fs/promises')).rename(renamed, join(directory, 'answer.md'))
+  const plain = await store.readArtifact({ taskId: task.id, runId: run.id, path: 'answer.md' })
+  assert.equal(plain.text, '# 回答')
+})
